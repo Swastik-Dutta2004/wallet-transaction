@@ -5,7 +5,7 @@
         try {
             await mongoose.connect(process.env.MONGO_URL) 
 
-            console.log("Connect to database.");
+            console.log("Databae is connected.");
             
         } catch (error) {
             console.log("Database is not connected.", error.message);

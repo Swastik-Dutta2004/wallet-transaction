@@ -30,8 +30,13 @@ const userSchema = new mongoose.Schema({
         type: String,
         enum: ["active", "blocked", "suspended"],
         default: "active"
-    }
-})
+    },
+
+},
+    {
+        timestamps: true,
+    },
+)
 
 const userModule = mongoose.module("User", userSchema)
 
