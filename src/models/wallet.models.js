@@ -3,7 +3,7 @@ const mongoose = require("mongoose")
 const walletSchema = new mongoose.Schema({
     ownerId: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: user,
+        ref: "User",
         require: true,
         unique: true
     },
@@ -28,6 +28,6 @@ const walletSchema = new mongoose.Schema({
     }
 })
 
-const WalletModel = mongoose.model("Wallet", walletSchema   )
+const WalletModel = mongoose.model("Wallet", walletSchema)
 
 module.exports = WalletModel
