@@ -1,7 +1,17 @@
-const mongoose = require('mongoose')
+import mongoose, { Document, Schema } from "mongoose"
 
-const userSchema = new mongoose.Schema({
-    name :{
+export interface IUser extends Document {
+    name: string;
+    email: string;
+    password: string;
+    role: "user" | "admin" | "merchant";
+    status: "active" | "blocked" | "suspended";
+    createdAt: Date;
+    updatedAt: Date
+}
+
+const userSchema = new Schema < IUser > ({
+    name: {
         type: String,
         required: true,
         trim: true
@@ -23,7 +33,7 @@ const userSchema = new mongoose.Schema({
     role: {
         type: String,
         enum: ["user", "admin", "merchant"],
-        default: "user" 
+        default: "user"
     },
 
     status: {
@@ -33,11 +43,11 @@ const userSchema = new mongoose.Schema({
     },
 
 },
-    {
-        timestamps: true,
-    },
+{
+    timestamps: true,
+},
 )
 
-const userModule = mongoose.model("User", userSchema)
+const User = mongoose.model < IUser > ("User", userSchema);
 
-module.exports = userModule
+export default User

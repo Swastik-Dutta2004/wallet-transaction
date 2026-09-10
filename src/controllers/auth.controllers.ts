@@ -1,41 +1,45 @@
-const userModel = require("../models/user.models")
-const WalletModel = require("../models/wallet.models")
+import { Request, Response } from "express"
+import user from "../models/user.models"
+import Wallet from "../models/wallet.models"
 const bycrpt = require("bcrypt")
 
 
-const registration = async (req, res) => {
+export const registerUser = async (
+    req: Request,
+    res: Response
+): Promise<void> => {
     try {
-        const {name, email, password} = req.body
+        const { name, email, password } = req.body
 
-        if (!name || !email ||!password) {
-            return res.status(401).json({
+        if (!name || !email || !password) {
+            res.status(401).json({
                 message: "Name, email, password are required."
             })
         }
 
-        const existingUser = await userModel.findOne({email})
+        const existingUser = await user.findOne({ email })
 
         if (existingUser) {
-            return res.status(401).json({
+            res.status(401).json({
                 message: "User is already exist"
             })
         }
 
         const hashedPassword = await bycrpt.hash(password, 10)
 
-        const User = await userModel.create({
+        const User = await user.create({
             name,
             email,
             password: hashedPassword
         })
 
-        const wallet = await WalletModel.create({
-            ownerId : User._id,
+        const wallet = await Wallet.create({
+            ownerId: User._id,
             balance: 0,
-            currecncy: "INR"
+            currency: "INR"
         })
 
-        return res.status(200).json({
+        res.status(200).json({
             message: "User registered successfully.",
             user: {
                 id: User._id,
@@ -45,16 +49,16 @@ const registration = async (req, res) => {
             wallet: {
                 id: wallet._id,
                 balance: wallet.balance,
-                currecncy: wallet.currecncy
+                currecncy: wallet.currency
             }
         })
     } catch (error) {
         console.log("Registration errro: ", error)
-        return res.status(401).json({
+        res.status(401).json({
             message: "Internal server error."
         })
-            
+
     }
 }
 
-module.exports = {registration}
+module.exports = { registerUser }
