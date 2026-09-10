@@ -14,20 +14,20 @@ const walletSchema = new Schema<IWallet>({
     ownerId: {
         type: Schema.Types.ObjectId,
         ref: "User",
-        require: true,
+        required: true,
         unique: true
     },
 
     balance: {
         type: Number,
-        require: true,
+        required: true,
         default: 0,
         min: 0
     },
 
     currency: {
         type : String,
-        require: true,
+        required: true,
         default: "INR"
     },
 

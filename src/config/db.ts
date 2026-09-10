@@ -9,11 +9,11 @@ const connectDB = async(): Promise<void> => {
             
         }
         await mongoose.connect(mongoURL)
-        console.log("Dataase is connect successfully.");
+        console.log("Database is connected successfully.");
         
         
     } catch (error) {
-        console.log("Databse connction failed: ", error);
+        console.log("Database connection failed: ", error);
         
     }
 }

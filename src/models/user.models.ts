@@ -19,15 +19,15 @@ const userSchema = new Schema < IUser > ({
 
     email: {
         type: String,
-        require: true,
+        required: true,
         unique: true,
-        lowecase: true,
+        lowercase: true,
         trim: true
     },
 
     password: {
         type: String,
-        require: true,
+        required: true,
     },
 
     role: {

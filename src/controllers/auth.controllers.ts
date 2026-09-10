@@ -1,7 +1,7 @@
 import { Request, Response } from "express"
 import user from "../models/user.models"
 import Wallet from "../models/wallet.models"
-const bycrpt = require("bcrypt")
+import bcrypt from "bcrypt"
 
 
 export const registerUser = async (
@@ -15,6 +15,7 @@ export const registerUser = async (
             res.status(401).json({
                 message: "Name, email, password are required."
             })
+            return
         }
 
         const existingUser = await user.findOne({ email })
@@ -23,9 +24,10 @@ export const registerUser = async (
             res.status(401).json({
                 message: "User is already exist"
             })
+            return
         }
 
-        const hashedPassword = await bycrpt.hash(password, 10)
+        const hashedPassword = await bcrypt.hash(password, 10)
 
         const User = await user.create({
             name,
@@ -49,16 +51,14 @@ export const registerUser = async (
             wallet: {
                 id: wallet._id,
                 balance: wallet.balance,
-                currecncy: wallet.currency
+                currency: wallet.currency
             }
         })
     } catch (error) {
-        console.log("Registration errro: ", error)
-        res.status(401).json({
+        console.log("Registration error: ", error)
+        res.status(500).json({
             message: "Internal server error."
         })
 
     }
 }
-
-module.exports = { registerUser }
