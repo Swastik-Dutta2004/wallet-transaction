@@ -1,6 +1,7 @@
+import mongoose from "mongoose"
 import { Request, Response } from "express"
-import user from "../models/user.models"
-import Wallet from "../models/wallet.models"
+import userModel from "../models/user.models"
+import walletModel from "../models/wallet.models"
 import bcrypt from "bcrypt"
 
 
@@ -8,6 +9,9 @@ export const registerUser = async (
     req: Request,
     res: Response
 ): Promise<void> => {
+
+    const session = await mongoose.startSession()
+    
     try {
         const { name, email, password } = req.body
 
@@ -18,28 +22,44 @@ export const registerUser = async (
             return
         }
 
-        const existingUser = await user.findOne({ email })
+        const existingUser = await userModel.findOne({ email })
 
         if (existingUser) {
-            res.status(401).json({
-                message: "User is already exist"
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(409).json({
+                message: "User already exists"
             })
             return
-        }
+        }   
 
         const hashedPassword = await bcrypt.hash(password, 10)
 
-        const User = await user.create({
-            name,
-            email,
-            password: hashedPassword
-        })
+        const [User] = await userModel.create(
+            [
+                {
+                    name,
+                    email,
+                    password: hashedPassword
+                }
+            ],
+            { session }
+        )
 
-        const wallet = await Wallet.create({
-            ownerId: User._id,
-            balance: 0,
-            currency: "INR"
-        })
+        const [wallet] = await walletModel.create(
+            [
+                {
+                    ownerId: User._id,
+                    balance: 0,
+                    currency: "INR"
+                }
+            ],
+            { session }
+        )
+
+        await session.commitTransaction()
+        session.endSession()
 
         res.status(200).json({
             message: "User registered successfully.",

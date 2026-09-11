@@ -38,6 +38,6 @@ const walletSchema = new Schema<IWallet>({
     }
 })
 
-const Wallet = mongoose.model("Wallet", walletSchema)
+const walletModel = mongoose.model("Wallet", walletSchema)
 
-export default Wallet
+export default walletModel
