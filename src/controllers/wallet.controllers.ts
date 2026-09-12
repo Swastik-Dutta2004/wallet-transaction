@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { Request, Response } from "express"
 import walletModel from "../models/wallet.models"
 import transactionModel from "../models/transaction.models";
@@ -50,11 +51,19 @@ export const addMoney = async (
     res: Response
 ): Promise<void> => {
 
+    const sessions = await mongoose.startSession()
+
     try {
+
+        sessions.startTransaction()
 
         const { userId, amount } = req.body
 
         if (!userId || amount == undefined) {
+
+            await sessions.abortTransaction()
+            sessions.endSession()
+
             res.status(401).json({
                 message: "UserId and amount both are needed."
             })
@@ -62,6 +71,10 @@ export const addMoney = async (
         }
 
         if (typeof amount !== "number" || amount <= 0) {
+
+            await sessions.abortTransaction()
+            sessions.endSession()
+
             res.status(401).json({
                 message: "Amount must be greater then 0"
             })
@@ -72,9 +85,13 @@ export const addMoney = async (
 
         const wallet = await walletModel.findOne({
             ownerId: userId
-        })
+        }).session(sessions)
 
         if (!wallet) {
+
+            await sessions.abortTransaction()
+            sessions.endSession()
+
             res.status(401).json({
                 message: "Wallet not found."
             })
@@ -82,6 +99,10 @@ export const addMoney = async (
         }
 
         if (wallet.status !== "active") {
+
+            await sessions.abortTransaction()
+            sessions.endSession()
+
             res.status(401).json({
                 message: "Wallet is not active."
             })
@@ -90,16 +111,21 @@ export const addMoney = async (
 
         wallet.balance += amountInPaisa
 
-        await wallet.save()
+        await wallet.save({session: sessions})
 
-        const transaction = await transactionModel.create({
-            walletID: wallet._id,
-            type: "CREDIT",
-            amount: amountInPaisa,
-            currency: "INR",
-            status: "Success",
-            description: "Money added to wallet."
-        })
+        const [transaction] = await transactionModel.create(
+            [
+                {
+                    walletID: wallet._id,
+                    type: "CREDIT",
+                    amount: amountInPaisa,
+                    currency: "INR",
+                    status: "Success",
+                    description: "Money added to wallet."
+                }
+            ],
+            {session: sessions}
+        )
 
         res.status(200).json({
             message: "Money added successfully.",
@@ -110,7 +136,7 @@ export const addMoney = async (
                 currency: wallet.currency
             },
 
-            transaction:{
+            transaction: {
                 id: transaction._id,
                 type: transaction.type,
                 amount: transaction.amount,
@@ -118,12 +144,20 @@ export const addMoney = async (
             }
         })
 
+        await sessions.commitTransaction()
+
     } catch (error) {
-        console.log("Add money error: ", error);
+
+        await sessions.abortTransaction()
         
+        console.log("Add money error: ", error);
+
         res.status(401).json({
             message: "Interval server error."
         })
+    }
+    finally{
+        sessions.endSession()
     }
 
 
