@@ -10,29 +10,30 @@ export const registerUser = async (
     res: Response
 ): Promise<void> => {
 
+    const { name, email, password } = req.body
+
+    if (!name || !email || !password) {
+        res.status(400).json({
+            message: "Name, email, password are required."
+        })
+        return
+    }
+
+    const existingUser = await userModel.findOne({ email })
+
+    if (existingUser) {
+
+        res.status(409).json({
+            message: "User already exists"
+        })
+        return
+    }
+
     const session = await mongoose.startSession()
-    
+
     try {
-        const { name, email, password } = req.body
 
-        if (!name || !email || !password) {
-            res.status(401).json({
-                message: "Name, email, password are required."
-            })
-            return
-        }
-
-        const existingUser = await userModel.findOne({ email })
-
-        if (existingUser) {
-            await session.abortTransaction()
-            session.endSession()
-
-            res.status(409).json({
-                message: "User already exists"
-            })
-            return
-        }   
+        session.startTransaction()
 
         const hashedPassword = await bcrypt.hash(password, 10)
 
@@ -59,7 +60,6 @@ export const registerUser = async (
         )
 
         await session.commitTransaction()
-        session.endSession()
 
         res.status(200).json({
             message: "User registered successfully.",
@@ -75,10 +75,18 @@ export const registerUser = async (
             }
         })
     } catch (error) {
+
+        await session.abortTransaction()
+
         console.log("Registration error: ", error)
+
         res.status(500).json({
             message: "Internal server error."
         })
 
+    }
+    
+    finally{
+        session.endSession()
     }
 }
