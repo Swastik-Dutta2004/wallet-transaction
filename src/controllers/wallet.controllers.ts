@@ -111,7 +111,7 @@ export const addMoney = async (
 
         wallet.balance += amountInPaisa
 
-        await wallet.save({session: sessions})
+        await wallet.save({ session: sessions })
 
         const [transaction] = await transactionModel.create(
             [
@@ -124,7 +124,7 @@ export const addMoney = async (
                     description: "Money added to wallet."
                 }
             ],
-            {session: sessions}
+            { session: sessions }
         )
 
         res.status(200).json({
@@ -149,16 +149,199 @@ export const addMoney = async (
     } catch (error) {
 
         await sessions.abortTransaction()
-        
+
         console.log("Add money error: ", error);
 
         res.status(401).json({
             message: "Interval server error."
         })
     }
-    finally{
+
+    finally {
         sessions.endSession()
+
     }
 
 
+}
+
+
+export const transferMoney = async (
+    req: Request,
+    res: Response
+): Promise<void> => {
+
+    const session = await mongoose.startSession()
+
+    try {
+
+        session.startTransaction()
+
+        const { senderId, receiverId, amount } = req.body
+
+        // Validate input
+        if (!senderId || !receiverId || amount === undefined) {
+
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(400).json({
+                message: "Sender ID, receiver ID and amount are required."
+            })
+
+            return
+        }
+
+        // Sender and receiver cannot be the same
+        if (senderId === receiverId) {
+
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(400).json({
+                message: "Sender and receiver cannot be the same."
+            })
+
+            return
+        }
+
+        // Validate amount
+        if (typeof amount !== "number" || amount <= 0) {
+
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(400).json({
+                message: "Amount must be greater than 0."
+            })
+
+            return
+        }
+
+        // Convert rupees to paise
+        const amountInPaise = Math.round(amount * 100)
+
+        // Find sender wallet
+        const senderWallet = await walletModel.findOne({
+            ownerId: senderId
+        }).session(session)
+
+        if (!senderWallet) {
+
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(404).json({
+                message: "Sender wallet not found."
+            })
+
+            return
+        }
+
+        // Find receiver wallet
+        const receiverWallet = await walletModel.findOne({
+            ownerId: receiverId
+        }).session(session)
+
+        if (!receiverWallet) {
+
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(404).json({
+                message: "Receiver wallet not found."
+            })
+
+            return
+        }
+
+        // Check wallet status
+        if (
+            senderWallet.status !== "active" ||
+            receiverWallet.status !== "active"
+        ) {
+
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(400).json({
+                message: "Both wallets must be active."
+            })
+
+            return
+        }
+
+        // Check sender balance
+        if (senderWallet.balance < amountInPaise) {
+
+            await session.abortTransaction()
+            session.endSession()
+
+            res.status(400).json({
+                message: "Insufficient wallet balance."
+            })
+
+            return
+        }
+
+        // Debit sender
+        senderWallet.balance -= amountInPaise
+
+        // Credit receiver
+        receiverWallet.balance += amountInPaise
+
+        // Save both wallets
+        await senderWallet.save({ session })
+        await receiverWallet.save({ session })
+
+        // Create transaction
+        const transaction = new transactionModel({
+            senderWalletId: senderWallet._id,
+            receiverWalletId: receiverWallet._id,
+            type: "TRANSFER",
+            amount: amountInPaise,
+            currency: senderWallet.currency,
+            status: "SUCCESS",
+            description: "Wallet-to-wallet transfer"
+        })
+
+        await transaction.save({ session })
+
+        // Commit transaction
+        await session.commitTransaction()
+        session.endSession()
+
+        res.status(200).json({
+
+            message: "Money transferred successfully.",
+
+            transfer: {
+                transactionId: transaction._id,
+                amount: transaction.amount,
+                currency: transaction.currency,
+                status: transaction.status
+            },
+
+            senderWallet: {
+                id: senderWallet._id,
+                balance: senderWallet.balance
+            },
+
+            receiverWallet: {
+                id: receiverWallet._id,
+                balance: receiverWallet.balance
+            }
+        })
+
+    } catch (error) {
+
+        await session.abortTransaction()
+        session.endSession()
+
+        console.log("Transfer error:", error)
+
+        res.status(500).json({
+            message: "Internal server error."
+        })
+    }
 }

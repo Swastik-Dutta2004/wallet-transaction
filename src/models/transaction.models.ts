@@ -1,12 +1,21 @@
 import mongoose, {Schema, Document, Types} from "mongoose"
+import walletModel from "./wallet.models";
 
 export interface ITransaction extends Document {
     walletID : Types.ObjectId,
-    type: "CREDIT" | "DEBIT",
+
+    senderWalletId : Types.ObjectId,
+    reciverWalletId: Types.ObjectId,
+
+    type: "CREDIT" | "DEBIT" | "TRANSFER",
+
     amount: number,
     currency: string,
+
     status: "Success" | "Pending" | "Failed",
+
     description?: string,
+    
     createdAt: Date,
     updatedAt: Date,
 }
@@ -19,9 +28,19 @@ const transcationSchema = new Schema<ITransaction> (
             required: true 
         },
 
+        senderWalletId: {
+            type: Schema.Types.ObjectId,
+            ref: "Wallet"
+        },
+
+        reciverWalletId: {
+            type: Schema.Types.ObjectId,
+            ref: "Wallet"
+        },
+
         type:{
             type: String,
-            enum: ["CREDIT", "DEBIT"],
+            enum: ["CREDIT", "DEBIT", "TRANSFER"],
             required: true
         },
 
