@@ -3,6 +3,8 @@ import { Request, Response } from "express"
 import userModel from "../models/user.models"
 import walletModel from "../models/wallet.models"
 import bcrypt from "bcrypt"
+import { AuthRequest } from "../middleware/auth.middleware"
+import jwt from "jsonwebtoken"
 
 
 export const registerUser = async (
@@ -85,8 +87,90 @@ export const registerUser = async (
         })
 
     }
-    
-    finally{
+
+    finally {
         session.endSession()
+    }
+}
+
+
+export const loginUser = async (
+    req: Request,
+    res: Response
+): Promise<void> => {
+    try {
+        const { email, password } = req.body
+
+        if (!email || !password) {
+            res.status(400).json({
+                message: "Email and password are required"
+            });
+            return;
+        }
+
+        const findUser = await userModel.findOne({ email })
+
+        if (!findUser) {
+            res.status(401).json({
+                message: "Email ID not found."
+            });
+            return;
+        }
+
+        const isCorrectPassword = await bcrypt.compare(
+            password,
+            findUser.password
+        )
+
+        if (!isCorrectPassword) {
+            res.status(401).json({
+                message: "Given wrong password."
+            });
+            return;
+        }
+
+        if (findUser.status !== "active") {
+            res.status(403).json({
+                message: "User account is not active"
+            });
+            return;
+        }
+
+        const secret = process.env.JWT_SECRET;
+
+        if (!secret) {
+            res.status(500).json({
+                message: "JWT secret is not configured"
+            });
+            return;
+        }
+
+
+        const token = jwt.sign(
+            {
+                userId: findUser._id.toString()
+            },
+            secret,
+            {
+                expiresIn: "1d"
+            }
+        )
+
+        res.status(200).json({
+            message: "Login successful",
+            token,
+            userModel: {
+                id: findUser._id,
+                name: findUser.name,
+                email: findUser.email,
+                role: findUser.role
+            }
+
+        })
+    } catch (error) {
+        console.error("Login error:", error);
+        res.status(500).json({
+            message: "Internal server error"
+        });
     }
 }

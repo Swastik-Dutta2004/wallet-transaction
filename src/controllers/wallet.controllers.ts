@@ -116,7 +116,7 @@ export const addMoney = async (
         const [transaction] = await transactionModel.create(
             [
                 {
-                    walletID: wallet._id,
+                    walletId: wallet._id,
                     type: "CREDIT",
                     amount: amountInPaisa,
                     currency: "INR",
@@ -301,7 +301,7 @@ export const transferMoney = async (
             type: "TRANSFER",
             amount: amountInPaise,
             currency: senderWallet.currency,
-            status: "SUCCESS",
+            status: "Success",
             description: "Wallet-to-wallet transfer"
         })
 

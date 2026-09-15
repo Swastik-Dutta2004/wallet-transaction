@@ -2,10 +2,10 @@ import mongoose, {Schema, Document, Types} from "mongoose"
 import walletModel from "./wallet.models";
 
 export interface ITransaction extends Document {
-    walletID : Types.ObjectId,
+    walletId : Types.ObjectId,
 
     senderWalletId : Types.ObjectId,
-    reciverWalletId: Types.ObjectId,
+    receiverWalletId: Types.ObjectId,
 
     type: "CREDIT" | "DEBIT" | "TRANSFER",
 
@@ -22,10 +22,9 @@ export interface ITransaction extends Document {
 
 const transcationSchema = new Schema<ITransaction> (
     {
-        walletID: {
+        walletId: {
             type: Schema.Types.ObjectId,
             ref: "Wallet",
-            required: true 
         },
 
         senderWalletId: {
@@ -33,7 +32,7 @@ const transcationSchema = new Schema<ITransaction> (
             ref: "Wallet"
         },
 
-        reciverWalletId: {
+        receiverWalletId: {
             type: Schema.Types.ObjectId,
             ref: "Wallet"
         },
