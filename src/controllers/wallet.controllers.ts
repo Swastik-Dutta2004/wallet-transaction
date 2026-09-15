@@ -2,14 +2,15 @@ import mongoose from "mongoose";
 import { Request, Response } from "express"
 import walletModel from "../models/wallet.models"
 import transactionModel from "../models/transaction.models";
+import {AuthRequest} from "../middleware/auth.middleware"
 
 export const getWallet = async (
-    req: Request,
+    req: AuthRequest,
     res: Response
 ): Promise<void> => {
 
     try {
-        const { userId } = req.body
+        const userId = req.user?.userId;
 
         if (!userId) {
             res.status(400).json({
@@ -47,127 +48,7 @@ export const getWallet = async (
 
 
 export const addMoney = async (
-    req: Request,
-    res: Response
-): Promise<void> => {
-
-    const sessions = await mongoose.startSession()
-
-    try {
-
-        sessions.startTransaction()
-
-        const { userId, amount } = req.body
-
-        if (!userId || amount == undefined) {
-
-            await sessions.abortTransaction()
-            sessions.endSession()
-
-            res.status(401).json({
-                message: "UserId and amount both are needed."
-            })
-            return
-        }
-
-        if (typeof amount !== "number" || amount <= 0) {
-
-            await sessions.abortTransaction()
-            sessions.endSession()
-
-            res.status(401).json({
-                message: "Amount must be greater then 0"
-            })
-            return
-        }
-
-        const amountInPaisa = Math.round(amount * 100)
-
-        const wallet = await walletModel.findOne({
-            ownerId: userId
-        }).session(sessions)
-
-        if (!wallet) {
-
-            await sessions.abortTransaction()
-            sessions.endSession()
-
-            res.status(401).json({
-                message: "Wallet not found."
-            })
-            return
-        }
-
-        if (wallet.status !== "active") {
-
-            await sessions.abortTransaction()
-            sessions.endSession()
-
-            res.status(401).json({
-                message: "Wallet is not active."
-            })
-            return
-        }
-
-        wallet.balance += amountInPaisa
-
-        await wallet.save({ session: sessions })
-
-        const [transaction] = await transactionModel.create(
-            [
-                {
-                    walletId: wallet._id,
-                    type: "CREDIT",
-                    amount: amountInPaisa,
-                    currency: "INR",
-                    status: "Success",
-                    description: "Money added to wallet."
-                }
-            ],
-            { session: sessions }
-        )
-
-        res.status(200).json({
-            message: "Money added successfully.",
-
-            wallet: {
-                id: wallet._id,
-                balance: wallet.balance,
-                currency: wallet.currency
-            },
-
-            transaction: {
-                id: transaction._id,
-                type: transaction.type,
-                amount: transaction.amount,
-                status: transaction.status
-            }
-        })
-
-        await sessions.commitTransaction()
-
-    } catch (error) {
-
-        await sessions.abortTransaction()
-
-        console.log("Add money error: ", error);
-
-        res.status(401).json({
-            message: "Interval server error."
-        })
-    }
-
-    finally {
-        sessions.endSession()
-
-    }
-
-
-}
-
-
-export const transferMoney = async (
-    req: Request,
+    req: AuthRequest,
     res: Response
 ): Promise<void> => {
 
@@ -177,16 +58,164 @@ export const transferMoney = async (
 
         session.startTransaction()
 
-        const { senderId, receiverId, amount } = req.body
+        const { amount } = req.body
 
-        // Validate input
-        if (!senderId || !receiverId || amount === undefined) {
+        // Get user ID from JWT
+        const userId = req.user?.userId
+
+        // Validate user and amount
+        if (!userId || amount === undefined) {
 
             await session.abortTransaction()
-            session.endSession()
 
             res.status(400).json({
-                message: "Sender ID, receiver ID and amount are required."
+                message: "User ID and amount are required."
+            })
+
+            return
+        }
+
+        // Validate amount
+        if (typeof amount !== "number" || amount <= 0) {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Amount must be greater than 0."
+            })
+
+            return
+        }
+
+        // Convert rupees to paise
+        const amountInPaise = Math.round(amount * 100)
+
+        // Find wallet using logged-in user's ID
+        const wallet = await walletModel.findOne({
+            ownerId: userId
+        }).session(session)
+
+        if (!wallet) {
+
+            await session.abortTransaction()
+
+            res.status(404).json({
+                message: "Wallet not found."
+            })
+
+            return
+        }
+
+        // Check wallet status
+        if (wallet.status !== "active") {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Wallet is not active."
+            })
+
+            return
+        }
+
+        // Add money to wallet
+        wallet.balance += amountInPaise
+
+        await wallet.save({ session })
+
+        // Create transaction
+        const transaction = new transactionModel({
+            walletId: wallet._id,
+            type: "CREDIT",
+            amount: amountInPaise,
+            currency: wallet.currency,
+            status: "Success",
+            description: "Money added to wallet."
+        })
+
+        await transaction.save({ session })
+
+        // Commit database transaction
+        await session.commitTransaction()
+
+        res.status(200).json({
+            message: "Money added successfully.",
+            wallet: {
+                id: wallet._id,
+                balance: wallet.balance,
+                currency: wallet.currency
+            },
+            transaction: {
+                id: transaction._id,
+                type: transaction.type,
+                amount: transaction.amount,
+                status: transaction.status
+            }
+        })
+
+    } catch (error) {
+
+        await session.abortTransaction()
+
+        console.log("Add money error:", error)
+
+        res.status(500).json({
+            message: "Internal server error."
+        })
+
+    } finally {
+
+        session.endSession()
+
+    }
+}
+
+
+export const transferMoney = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+
+    const session = await mongoose.startSession()
+
+    try {
+
+        session.startTransaction()
+
+        const { receiverId, amount } = req.body
+
+        // Get sender ID from JWT
+        const senderId = req.user?.userId
+
+        // Validate input
+        if (!senderId ) {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Sender ID required."
+            })
+
+            return
+        }
+
+        if ( !receiverId ) {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Receiver ID required."
+            })
+
+            return
+        }
+
+        if ( amount === undefined) {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: " amount is required."
             })
 
             return
@@ -196,7 +225,6 @@ export const transferMoney = async (
         if (senderId === receiverId) {
 
             await session.abortTransaction()
-            session.endSession()
 
             res.status(400).json({
                 message: "Sender and receiver cannot be the same."
@@ -209,7 +237,6 @@ export const transferMoney = async (
         if (typeof amount !== "number" || amount <= 0) {
 
             await session.abortTransaction()
-            session.endSession()
 
             res.status(400).json({
                 message: "Amount must be greater than 0."
@@ -229,7 +256,6 @@ export const transferMoney = async (
         if (!senderWallet) {
 
             await session.abortTransaction()
-            session.endSession()
 
             res.status(404).json({
                 message: "Sender wallet not found."
@@ -246,7 +272,6 @@ export const transferMoney = async (
         if (!receiverWallet) {
 
             await session.abortTransaction()
-            session.endSession()
 
             res.status(404).json({
                 message: "Receiver wallet not found."
@@ -262,7 +287,6 @@ export const transferMoney = async (
         ) {
 
             await session.abortTransaction()
-            session.endSession()
 
             res.status(400).json({
                 message: "Both wallets must be active."
@@ -275,7 +299,6 @@ export const transferMoney = async (
         if (senderWallet.balance < amountInPaise) {
 
             await session.abortTransaction()
-            session.endSession()
 
             res.status(400).json({
                 message: "Insufficient wallet balance."
@@ -294,7 +317,7 @@ export const transferMoney = async (
         await senderWallet.save({ session })
         await receiverWallet.save({ session })
 
-        // Create transaction
+        // Create transfer transaction
         const transaction = new transactionModel({
             senderWalletId: senderWallet._id,
             receiverWalletId: receiverWallet._id,
@@ -309,24 +332,19 @@ export const transferMoney = async (
 
         // Commit transaction
         await session.commitTransaction()
-        session.endSession()
 
         res.status(200).json({
-
             message: "Money transferred successfully.",
-
             transfer: {
                 transactionId: transaction._id,
                 amount: transaction.amount,
                 currency: transaction.currency,
                 status: transaction.status
             },
-
             senderWallet: {
                 id: senderWallet._id,
                 balance: senderWallet.balance
             },
-
             receiverWallet: {
                 id: receiverWallet._id,
                 balance: receiverWallet.balance
@@ -336,12 +354,17 @@ export const transferMoney = async (
     } catch (error) {
 
         await session.abortTransaction()
-        session.endSession()
 
         console.log("Transfer error:", error)
 
         res.status(500).json({
             message: "Internal server error."
         })
+
+    } finally {
+
+        session.endSession()
+
     }
 }
+
