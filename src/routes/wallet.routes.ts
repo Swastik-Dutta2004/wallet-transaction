@@ -2,7 +2,8 @@ import express from "express"
 import {
     getWallet,
     addMoney,
-    transferMoney
+    transferMoney,
+    getTransactions
 } from "../controllers/wallet.controllers"
 import {authenticateUser} from "../middleware/auth.middleware"
 
@@ -13,5 +14,7 @@ router.get("/get-wallet", authenticateUser, getWallet)
 router.post("/add-money", authenticateUser, addMoney)
 
 router.post("/transfer-money", authenticateUser, transferMoney)
+
+router.get("/transactions", authenticateUser, getTransactions)
 
 export default router

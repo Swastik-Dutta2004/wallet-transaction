@@ -368,3 +368,56 @@ export const transferMoney = async (
     }
 }
 
+
+export const getTransactions = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+    try {
+
+        const userId = req.user?.userId
+
+        if (!userId) {
+            res.status(401).json({
+                message: "User authentication required."
+            })
+            return
+        }
+
+        // Find user's wallet
+        const wallet = await walletModel.findOne({
+            ownerId: userId
+        })
+
+        if (!wallet) {
+            res.status(404).json({
+                message: "Wallet not found."
+            })
+            return
+        }
+
+        // Find transactions related to this wallet
+        const transactions = await transactionModel
+            .find({
+                $or: [
+                    { walletId: wallet._id },
+                    { senderWalletId: wallet._id },
+                    { receiverWalletId: wallet._id }
+                ]
+            })
+            .sort({ createdAt: -1 })
+
+        res.status(200).json({
+            message: "Transactions fetched successfully.",
+            transactions
+        })
+
+    } catch (error) {
+
+        console.error("Get transactions error:", error)
+
+        res.status(500).json({
+            message: "Internal server error."
+        })
+    }
+}
