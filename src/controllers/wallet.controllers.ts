@@ -2,7 +2,9 @@ import mongoose from "mongoose";
 import { Request, Response } from "express"
 import walletModel from "../models/wallet.models"
 import transactionModel from "../models/transaction.models";
-import {AuthRequest} from "../middleware/auth.middleware"
+import { AuthRequest } from "../middleware/auth.middleware"
+import ledgerModel from "../models/ledger.models"
+
 
 export const getWallet = async (
     req: AuthRequest,
@@ -59,6 +61,41 @@ export const addMoney = async (
         session.startTransaction()
 
         const { amount } = req.body
+
+        const idempotencyKey = req.headers["idempotency-key"]
+
+        if (!idempotencyKey || typeof idempotencyKey !== "string") {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Idempotency-Key header is required."
+            })
+
+            return
+        }
+
+
+        const existingTransaction = await transactionModel.findOne({
+            idempotencyKey
+        }).session(session)
+
+        if (existingTransaction) {
+            await session.abortTransaction()
+
+            res.status(200).json({
+                message: "Request already processed.",
+                transaction: {
+                    id: existingTransaction._id,
+                    type: existingTransaction.type,
+                    amount: existingTransaction.amount,
+                    status: existingTransaction.status
+                }
+            })
+
+            return
+        }
+
 
         // Get user ID from JWT
         const userId = req.user?.userId
@@ -119,7 +156,12 @@ export const addMoney = async (
         }
 
         // Add money to wallet
+
+        const balanceBefore = wallet.balance
+
         wallet.balance += amountInPaise
+
+        const balanceAfter = wallet.balance
 
         await wallet.save({ session })
 
@@ -129,11 +171,24 @@ export const addMoney = async (
             type: "CREDIT",
             amount: amountInPaise,
             currency: wallet.currency,
+            idempotencyKey,
             status: "Success",
             description: "Money added to wallet."
         })
-
         await transaction.save({ session })
+
+        const ledger = new ledgerModel({
+            walletId: wallet._id,
+            transactionId: transaction._id,
+            type: "CREDIT",
+            amount: amountInPaise,
+            balanceBefore,
+            balanceAfter,
+            currency: wallet.currency,
+            description: "Money added to wallet."
+        })
+
+        await ledger.save({ session })
 
         // Commit database transaction
         await session.commitTransaction()
@@ -184,11 +239,25 @@ export const transferMoney = async (
 
         const { receiverId, amount } = req.body
 
+        const idempotencyKey = req.headers["idempotency-key"]
+
         // Get sender ID from JWT
         const senderId = req.user?.userId
+        
+
+        if (!idempotencyKey || typeof idempotencyKey !== "string") {
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Idempotency-Key header is required."
+            })
+
+            return
+        }
+
 
         // Validate input
-        if (!senderId ) {
+        if (!senderId) {
 
             await session.abortTransaction()
 
@@ -199,7 +268,7 @@ export const transferMoney = async (
             return
         }
 
-        if ( !receiverId ) {
+        if (!receiverId) {
 
             await session.abortTransaction()
 
@@ -210,7 +279,7 @@ export const transferMoney = async (
             return
         }
 
-        if ( amount === undefined) {
+        if (amount === undefined) {
 
             await session.abortTransaction()
 
@@ -307,11 +376,36 @@ export const transferMoney = async (
             return
         }
 
-        // Debit sender
-        senderWallet.balance -= amountInPaise
+        
+        const existingTransaction = await transactionModel.findOne({
+            idempotencyKey
+        }).session(session)
 
-        // Credit receiver
+
+        if (existingTransaction) {
+            await session.abortTransaction()
+
+            res.status(200).json({
+                message: "Request already processed.",
+                transaction: {
+                    id: existingTransaction._id,
+                    type: existingTransaction.type,
+                    amount: existingTransaction.amount,
+                    status: existingTransaction.status
+                }
+            })
+
+            return
+        }
+
+        const senderBalanceBefore = senderWallet.balance
+        const receiverBalanceBefore = receiverWallet.balance
+
+        senderWallet.balance -= amountInPaise
         receiverWallet.balance += amountInPaise
+
+        const senderBalanceAfter = senderWallet.balance
+        const receiverBalanceAfter = receiverWallet.balance
 
         // Save both wallets
         await senderWallet.save({ session })
@@ -324,11 +418,40 @@ export const transferMoney = async (
             type: "TRANSFER",
             amount: amountInPaise,
             currency: senderWallet.currency,
+            idempotencyKey,
             status: "Success",
             description: "Wallet-to-wallet transfer"
         })
 
         await transaction.save({ session })
+
+
+        const senderLedger = new ledgerModel({
+            walletId: senderWallet._id,
+            transactionId: transaction._id,
+            type: "DEBIT",
+            amount: amountInPaise,
+            balanceBefore: senderBalanceBefore,
+            balanceAfter: senderBalanceAfter,
+            currency: senderWallet.currency,
+            description: "Wallet-to-wallet transfer"
+        })
+
+        await senderLedger.save({ session })
+
+
+        const receiverLedger = new ledgerModel({
+            walletId: receiverWallet._id,
+            transactionId: transaction._id,
+            type: "CREDIT",
+            amount: amountInPaise,
+            balanceBefore: receiverBalanceBefore,
+            balanceAfter: receiverBalanceAfter,
+            currency: receiverWallet.currency,
+            description: "Wallet-to-wallet transfer"
+        })
+
+        await receiverLedger.save({ session })
 
         // Commit transaction
         await session.commitTransaction()

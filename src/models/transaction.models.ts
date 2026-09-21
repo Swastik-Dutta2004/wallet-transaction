@@ -1,10 +1,10 @@
-import mongoose, {Schema, Document, Types} from "mongoose"
+import mongoose, { Schema, Document, Types } from "mongoose"
 import walletModel from "./wallet.models";
 
 export interface ITransaction extends Document {
-    walletId : Types.ObjectId,
+    walletId: Types.ObjectId,
 
-    senderWalletId : Types.ObjectId,
+    senderWalletId: Types.ObjectId,
     receiverWalletId: Types.ObjectId,
 
     type: "CREDIT" | "DEBIT" | "TRANSFER",
@@ -14,13 +14,15 @@ export interface ITransaction extends Document {
 
     status: "Success" | "Pending" | "Failed",
 
+    idempotencyKey?: string;
+
     description?: string,
-    
+
     createdAt: Date,
     updatedAt: Date,
 }
 
-const transcationSchema = new Schema<ITransaction> (
+const transcationSchema = new Schema<ITransaction>(
     {
         walletId: {
             type: Schema.Types.ObjectId,
@@ -37,7 +39,7 @@ const transcationSchema = new Schema<ITransaction> (
             ref: "Wallet"
         },
 
-        type:{
+        type: {
             type: String,
             enum: ["CREDIT", "DEBIT", "TRANSFER"],
             required: true
@@ -60,6 +62,12 @@ const transcationSchema = new Schema<ITransaction> (
             type: String,
             enum: ["Success", "Pending", "Failed"],
             default: "Pending"
+        },
+
+        idempotencyKey: {
+            type: String,
+            unique: true,
+            sparse: true
         },
 
         description: {
