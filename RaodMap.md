@@ -12,7 +12,7 @@ content = r"""# Payment / FinTech Backend Engineer Roadmap
 
 - [ ] 2–3 hours/day → approximately 10–12 months
 - [ ] 4–5 hours/day → approximately 7–9 months
-- [ ] 6+ hours/day → approximately 5–7 months
+- [x] 6+ hours/day → approximately 5–7 months
 
 > You do not need to wait until the roadmap is completely finished before applying. Start applying to general backend, FinTech, internship, and junior roles around Month 4–6 while continuing the roadmap.
 
@@ -23,21 +23,21 @@ content = r"""# Payment / FinTech Backend Engineer Roadmap
 
 ### TypeScript
 
-- [ ] Type aliases and interfaces
+- [x] Type aliases and interfaces
 - [ ] Generics
 - [ ] Utility types
 - [ ] Discriminated unions
-- [ ] Strict TypeScript
+- [x] Strict TypeScript
 - [ ] DTOs
 - [ ] Type-safe API design
-- [ ] Error types and error handling
+- [x] Error types and error handling
 
 ### Node.js
 
-- [ ] Event loop
-- [ ] Async/await
-- [ ] Promises
-- [ ] Error handling
+- [x] Event loop
+- [x] Async/await
+- [x] Promises
+- [x] Error handling
 - [ ] Streams
 - [ ] Buffers
 - [ ] Concurrency basics
@@ -47,11 +47,11 @@ content = r"""# Payment / FinTech Backend Engineer Roadmap
 
 ### Express / REST APIs
 
-- [ ] REST API design
-- [ ] Controllers
-- [ ] Services
-- [ ] Repositories
-- [ ] Middleware
+- [x] REST API design
+- [x] Controllers
+- [x] Services
+- [x] Repositories
+- [x] Middleware
 - [ ] Validation
 - [ ] Centralized error handling
 - [ ] Pagination
@@ -61,27 +61,27 @@ content = r"""# Payment / FinTech Backend Engineer Roadmap
 
 ### Authentication & Authorization
 
-- [ ] JWT
+- [x] JWT
 - [ ] Sessions
-- [ ] Password hashing
-- [ ] Refresh tokens
+- [x] Password hashing
+- [x] Refresh tokens
 - [ ] RBAC
-- [ ] API keys
+- [x] API keys
 - [ ] MFA basics
-- [ ] Secure cookies
-- [ ] Authorization middleware
+- [x] Secure cookies
+- [x] Authorization middleware
 
 ### PostgreSQL
 
-- [ ] SQL fundamentals
-- [ ] Table relationships
-- [ ] Primary keys
-- [ ] Foreign keys
+- [x] SQL fundamentals
+- [x] Table relationships
+- [x] Primary keys
+- [x] Foreign keys
 - [ ] Constraints
 - [ ] Indexes
 - [ ] Composite indexes
 - [ ] Joins
-- [ ] Transactions
+- [x] Transactions
 - [ ] ACID
 - [ ] Isolation levels
 - [ ] Row locking
@@ -109,20 +109,20 @@ content = r"""# Payment / FinTech Backend Engineer Roadmap
 
 ### Wallet
 
-- [ ] User registration
-- [ ] Wallet creation
-- [ ] Wallet balance
-- [ ] Add money
+- [x] User registration
+- [x] Wallet creation
+- [x] Wallet balance
+- [x] Add money
 - [ ] Withdraw money
-- [ ] Transfer money
-- [ ] Transaction history
+- [x] Transfer money
+- [x] Transaction history
 - [ ] Currency handling
-- [ ] Store money as integer paise/cents
-- [ ] Prevent negative balances
+- [x] Store money as integer paise/cents
+- [x] Prevent negative balances
 
 ### Transactions
 
-- [ ] Database transactions
+- [x] Database transactions
 - [ ] Atomic operations
 - [ ] Concurrent transfer handling
 - [ ] Row-level locking
@@ -134,13 +134,13 @@ content = r"""# Payment / FinTech Backend Engineer Roadmap
 ### Double-entry Ledger
 
 - [ ] Understand double-entry accounting
-- [ ] Create ledger accounts
-- [ ] Create debit entries
-- [ ] Create credit entries
-- [ ] Link ledger entries to transactions
-- [ ] Track balance before/after
+- [x] Create ledger accounts
+- [x] Create debit entries
+- [x] Create credit entries
+- [x] Link ledger entries to transactions
+- [x] Track balance before/after
 - [ ] Make ledger entries immutable
-- [ ] Verify that debits and credits balance
+- [x] Verify that debits and credits balance
 
 Example:
 
