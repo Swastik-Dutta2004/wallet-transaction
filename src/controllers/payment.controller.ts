@@ -114,10 +114,11 @@ export const verifyPayment = async (
     req: AuthRequest,
     res: Response
 ): Promise<void> => {
+
     const session = await mongoose.startSession();
 
     try {
-        session.startTransaction();
+        const userId = req.user?.userId;
 
         const {
             razorpay_order_id,
@@ -125,26 +126,22 @@ export const verifyPayment = async (
             razorpay_signature
         } = req.body;
 
-        const userId = req.user?.userId;
+        // 1. Check authenticated user
+        if (!userId) {
+            res.status(401).json({
+                message: "User is not authenticated."
+            });
+            return;
+        }
 
+        // 2. Validate Razorpay response
         if (
             !razorpay_order_id ||
             !razorpay_payment_id ||
             !razorpay_signature
         ) {
-            await session.abortTransaction();
-
             res.status(400).json({
                 message: "Payment verification details are required."
-            });
-            return;
-        }
-
-        if (!userId) {
-            await session.abortTransaction();
-
-            res.status(401).json({
-                message: "User is not authenticated."
             });
             return;
         }
@@ -152,15 +149,13 @@ export const verifyPayment = async (
         const secret = process.env.RAZORPAY_KEY_SECRET;
 
         if (!secret) {
-            await session.abortTransaction();
-
             res.status(500).json({
                 message: "Razorpay secret is not configured."
             });
             return;
         }
 
-        // 1. Verify Razorpay signature
+        // 3. Verify Razorpay signature
 
         const body =
             razorpay_order_id + "|" + razorpay_payment_id;
@@ -171,23 +166,41 @@ export const verifyPayment = async (
             .digest("hex");
 
         if (expectedSignature !== razorpay_signature) {
-            await session.abortTransaction();
-
             res.status(400).json({
                 message: "Payment verification failed."
             });
             return;
         }
 
-        // 2. Check whether this payment was already processed
+        // 4. Find our PaymentOrder
+
+        const paymentOrder = await PaymentOrder.findOne({
+            razorpayOrderId: razorpay_order_id
+        });
+
+        if (!paymentOrder) {
+            res.status(404).json({
+                message: "Payment order not found."
+            });
+            return;
+        }
+
+        // 5. Make sure this order belongs to this user
+
+        if (paymentOrder.userId.toString() !== userId) {
+            res.status(403).json({
+                message: "This payment order does not belong to this user."
+            });
+            return;
+        }
+
+        // 6. Check if already processed
 
         const existingPayment = await Payment.findOne({
             razorpayPaymentId: razorpay_payment_id
-        }).session(session);
+        });
 
         if (existingPayment) {
-            await session.abortTransaction();
-
             res.status(200).json({
                 message: "Payment has already been processed.",
                 paymentId: existingPayment.razorpayPaymentId
@@ -195,14 +208,26 @@ export const verifyPayment = async (
             return;
         }
 
+        // 7. Get actual order details from Razorpay
 
-        const order = await razorpay.orders.fetch(
+        const razorpayOrder = await razorpay.orders.fetch(
             razorpay_order_id
         );
 
-        console.log("Razorpay order:", order);
+        // 8. Make sure the amount matches
 
-        // 3. Find user's wallet
+        if (razorpayOrder.amount !== paymentOrder.amount) {
+            res.status(400).json({
+                message: "Payment amount does not match the order."
+            });
+            return;
+        }
+
+        // 9. Start MongoDB transaction
+
+        session.startTransaction();
+
+        // Find user's wallet
 
         const wallet = await Wallet.findOne({
             ownerId: userId
@@ -226,24 +251,92 @@ export const verifyPayment = async (
             return;
         }
 
-        // We will get the amount from the Razorpay order
-        // in the next refinement.
-        // For now this is only the verification flow.
+        // 10. Update wallet balance
+
+        const balanceBefore = wallet.balance;
+
+        wallet.balance += paymentOrder.amount;
+
+        const balanceAfter = wallet.balance;
+
+        await wallet.save({ session });
+
+        // 11. Create Payment record
+
+        const payment = new Payment({
+            userId,
+            razorpayOrderId: razorpay_order_id,
+            razorpayPaymentId: razorpay_payment_id,
+            razorpaySignature: razorpay_signature,
+            amount: paymentOrder.amount,
+            currency: paymentOrder.currency,
+            status: "SUCCESS"
+        });
+
+        await payment.save({ session });
+
+        // 12. Create wallet transaction
+
+        const transaction = new Transaction({
+            walletId: wallet._id,
+            type: "CREDIT",
+            amount: paymentOrder.amount,
+            currency: paymentOrder.currency,
+            status: "Success",
+            description: "Money added through Razorpay"
+        });
+
+        await transaction.save({ session });
+
+        // 13. Create ledger entry
+
+        const ledger = new Ledger({
+            walletId: wallet._id,
+            transactionId: transaction._id,
+            type: "CREDIT",
+            amount: paymentOrder.amount,
+            balanceBefore,
+            balanceAfter,
+            currency: paymentOrder.currency,
+            description: "Razorpay wallet recharge"
+        });
+
+        await ledger.save({ session });
+
+        // 14. Update PaymentOrder
+
+        paymentOrder.status = "PAID";
+
+        await paymentOrder.save({ session });
+
+        // 15. Commit everything
+
+        await session.commitTransaction();
 
         res.status(200).json({
-            message: "Payment verified successfully.",
-            razorpayOrderId: razorpay_order_id,
-            razorpayPaymentId: razorpay_payment_id
+            message: "Payment verified and wallet credited successfully.",
+            payment: {
+                paymentId: payment.razorpayPaymentId,
+                orderId: payment.razorpayOrderId,
+                amount: payment.amount,
+                currency: payment.currency
+            },
+            wallet: {
+                balance: wallet.balance,
+                currency: wallet.currency
+            }
         });
 
     } catch (error) {
+
         await session.abortTransaction();
 
         console.error("Payment verification error:", error);
 
         res.status(500).json({
-            message: "Internal server error."
+            message: "Payment verification failed."
         });
+
     } finally {
         session.endSession();
     }
