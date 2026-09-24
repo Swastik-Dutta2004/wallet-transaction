@@ -9,6 +9,7 @@ import Wallet from "../models/wallet.models";
 import Transaction from "../models/transaction.models";
 import Ledger from "../models/ledger.models";
 import { AuthRequest } from "../middleware/auth.middleware"
+import PaymentOrder from "../models/payment-order.models"
 
 const razorpay = new Razorpay({
     key_id: process.env.RAZORPAY_KEY_ID!,
@@ -16,12 +17,23 @@ const razorpay = new Razorpay({
 });
 
 export const createOrder = async (
-    req: Request,
+    req: AuthRequest,
     res: Response
 ): Promise<void> => {
     try {
+        const userId = req.user?.userId;
+        const idempotencyKey = req.headers["idempotency-key"];
         const { amount } = req.body;
 
+        // Check authenticated user
+        if (!userId) {
+            res.status(401).json({
+                message: "User is not authenticated."
+            });
+            return;
+        }
+
+        // Validate amount
         if (!amount || amount <= 0) {
             res.status(400).json({
                 message: "Amount must be greater than 0."
@@ -29,15 +41,55 @@ export const createOrder = async (
             return;
         }
 
+        // Validate idempotency key
+        if (!idempotencyKey || typeof idempotencyKey !== "string") {
+            res.status(400).json({
+                message: "Idempotency-Key header is required."
+            });
+            return;
+        }
+
+        // Check if this request was already processed
+        const existingPaymentOrder = await PaymentOrder.findOne({
+            idempotencyKey
+        });
+
+        if (existingPaymentOrder) {
+            res.status(200).json({
+                message: "Request already processed.",
+                order: {
+                    id: existingPaymentOrder.razorpayOrderId,
+                    amount: existingPaymentOrder.amount,
+                    currency: existingPaymentOrder.currency,
+                    status: existingPaymentOrder.status
+                }
+            });
+            return;
+        }
+
         // Convert INR to paise
         const amountInPaise = Math.round(amount * 100);
 
+        // Create order on Razorpay
         const order = await razorpay.orders.create({
             amount: amountInPaise,
             currency: "INR",
             receipt: `receipt_${Date.now()}`
         });
 
+        // Save Razorpay order in our database
+        const paymentOrder = new PaymentOrder({
+            userId,
+            razorpayOrderId: order.id,
+            amount: amountInPaise,
+            currency: "INR",
+            idempotencyKey,
+            status: "CREATED"
+        });
+
+        await paymentOrder.save();
+
+        // Send order details to frontend
         res.status(201).json({
             message: "Razorpay order created successfully.",
             order: {
@@ -47,6 +99,7 @@ export const createOrder = async (
                 status: order.status
             }
         });
+
     } catch (error) {
         console.error("Create Razorpay order error:", error);
 
@@ -142,6 +195,13 @@ export const verifyPayment = async (
             return;
         }
 
+
+        const order = await razorpay.orders.fetch(
+            razorpay_order_id
+        );
+
+        console.log("Razorpay order:", order);
+
         // 3. Find user's wallet
 
         const wallet = await Wallet.findOne({
@@ -168,7 +228,6 @@ export const verifyPayment = async (
 
         // We will get the amount from the Razorpay order
         // in the next refinement.
-        //
         // For now this is only the verification flow.
 
         res.status(200).json({

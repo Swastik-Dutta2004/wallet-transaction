@@ -239,7 +239,7 @@ export const transferMoney = async (
 
         const { receiverId, amount } = req.body
 
-        const idempotencyKey = req.headers["idempotency-key"]
+        const idempotencyKey = req.headers["idempotency-key"]   
 
         // Get sender ID from JWT
         const senderId = req.user?.userId
