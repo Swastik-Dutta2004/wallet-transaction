@@ -341,3 +341,386 @@ export const verifyPayment = async (
         session.endSession();
     }
 };
+
+
+
+export const handleWebhook = async (
+    req: Request,
+    res: Response
+): Promise<void> => {
+
+    const session = await mongoose.startSession();
+
+    try {
+
+        // 1. Get webhook secret
+
+        const webhookSecret =
+            process.env.RAZORPAY_WEBHOOK_SECRET;
+
+        if (!webhookSecret) {
+            res.status(500).json({
+                message: "Razorpay webhook secret is not configured."
+            });
+            return;
+        }
+
+        // 2. Get Razorpay signature
+
+        const razorpaySignature =
+            req.headers["x-razorpay-signature"];
+
+        if (
+            !razorpaySignature ||
+            typeof razorpaySignature !== "string"
+        ) {
+            res.status(400).json({
+                message: "Webhook signature is missing."
+            });
+            return;
+        }
+
+        // 3. Get raw request body
+
+        const rawBody = (req as any).rawBody;
+
+        if (!rawBody) {
+            res.status(400).json({
+                message: "Raw webhook body is missing."
+            });
+            return;
+        }
+
+        // 4. Generate expected signature
+
+        const expectedSignature = crypto
+            .createHmac("sha256", webhookSecret)
+            .update(rawBody)
+            .digest("hex");
+
+        // 5. Verify webhook signature
+
+        if (expectedSignature !== razorpaySignature) {
+            res.status(400).json({
+                message: "Invalid webhook signature."
+            });
+            return;
+        }
+
+        // Webhook is authentic
+
+        const event = req.body.event;
+
+        console.log(
+            "Razorpay webhook received:",
+            event
+        );
+
+        // =====================================================
+        // PAYMENT CAPTURED
+        // =====================================================
+
+        if (event === "payment.captured") {
+
+            const paymentEntity =
+                req.body.payload?.payment?.entity;
+
+            if (!paymentEntity) {
+                res.status(400).json({
+                    message: "Payment data is missing."
+                });
+                return;
+            }
+
+            const razorpayPaymentId =
+                paymentEntity.id;
+
+            const razorpayOrderId =
+                paymentEntity.order_id;
+
+            const amount =
+                paymentEntity.amount;
+
+            const currency =
+                paymentEntity.currency;
+
+            // 6. Find our PaymentOrder
+
+            const paymentOrder =
+                await PaymentOrder.findOne({
+                    razorpayOrderId
+                });
+
+            if (!paymentOrder) {
+                res.status(404).json({
+                    message: "Payment order not found."
+                });
+                return;
+            }
+
+            // 7. Verify amount
+
+            if (paymentOrder.amount !== amount) {
+                res.status(400).json({
+                    message: "Payment amount does not match the order."
+                });
+                return;
+            }
+
+            // 8. Verify currency
+
+            if (paymentOrder.currency !== currency) {
+                res.status(400).json({
+                    message: "Payment currency does not match the order."
+                });
+                return;
+            }
+
+            // 9. Check if this payment was already processed
+
+            const existingPayment =
+                await Payment.findOne({
+                    razorpayPaymentId
+                });
+
+            if (existingPayment) {
+
+                res.status(200).json({
+                    message: "Payment already processed."
+                });
+
+                return;
+            }
+
+            // =================================================
+            // START MONGODB TRANSACTION
+            // =================================================
+
+            session.startTransaction();
+
+            // 10. Re-check inside transaction
+            // Protects against simultaneous webhook requests
+
+            const existingTransaction =
+                await Transaction.findOne({
+                    idempotencyKey:
+                        paymentOrder.idempotencyKey
+                }).session(session);
+
+            if (existingTransaction) {
+
+                await session.commitTransaction();
+
+                res.status(200).json({
+                    message: "Payment already processed."
+                });
+
+                return;
+            }
+
+            // 11. Find user's wallet
+
+            const wallet =
+                await Wallet.findOne({
+                    ownerId: paymentOrder.userId
+                }).session(session);
+
+            if (!wallet) {
+
+                await session.abortTransaction();
+
+                res.status(404).json({
+                    message: "Wallet not found."
+                });
+
+                return;
+            }
+
+            // 12. Check wallet status
+
+            if (wallet.status !== "active") {
+
+                await session.abortTransaction();
+
+                res.status(400).json({
+                    message: "Wallet is not active."
+                });
+
+                return;
+            }
+
+            // 13. Store balance before
+
+            const balanceBefore =
+                wallet.balance;
+
+            // 14. Credit wallet
+
+            wallet.balance += paymentOrder.amount;
+
+            const balanceAfter =
+                wallet.balance;
+
+            await wallet.save({
+                session
+            });
+
+            // 15. Create Payment
+
+            const payment = new Payment({
+                userId: paymentOrder.userId,
+                razorpayOrderId,
+                razorpayPaymentId,
+                razorpaySignature,
+                amount: paymentOrder.amount,
+                currency: paymentOrder.currency,
+                status: "SUCCESS"
+            });
+
+            await payment.save({
+                session
+            });
+
+            // 16. Create Transaction
+
+            const transaction = new Transaction({
+                walletId: wallet._id,
+                type: "CREDIT",
+                amount: paymentOrder.amount,
+                currency: paymentOrder.currency,
+                status: "Success",
+
+                // IMPORTANT:
+                // Reuse the idempotency key
+                // from PaymentOrder
+
+                idempotencyKey:
+                    paymentOrder.idempotencyKey,
+
+                description:
+                    "Money added through Razorpay webhook"
+            });
+
+            await transaction.save({
+                session
+            });
+
+            // 17. Create Ledger
+
+            const ledger = new Ledger({
+                walletId: wallet._id,
+                transactionId: transaction._id,
+                type: "CREDIT",
+                amount: paymentOrder.amount,
+                balanceBefore,
+                balanceAfter,
+                currency: paymentOrder.currency,
+                description:
+                    "Razorpay wallet recharge"
+            });
+
+            await ledger.save({
+                session
+            });
+
+            // 18. Mark PaymentOrder as PAID
+
+            paymentOrder.status = "PAID";
+
+            await paymentOrder.save({
+                session
+            });
+
+            // 19. Commit everything
+
+            await session.commitTransaction();
+
+            console.log(
+                "Wallet credited successfully:",
+                razorpayPaymentId
+            );
+
+            res.status(200).json({
+                message:
+                    "Payment captured and wallet credited successfully."
+            });
+
+            return;
+        }
+
+        // =====================================================
+        // PAYMENT FAILED
+        // =====================================================
+
+        if (event === "payment.failed") {
+
+            const paymentEntity =
+                req.body.payload?.payment?.entity;
+
+            if (!paymentEntity) {
+                res.status(400).json({
+                    message: "Payment data is missing."
+                });
+                return;
+            }
+
+            const razorpayOrderId =
+                paymentEntity.order_id;
+
+            console.log(
+                "Razorpay payment failed:",
+                paymentEntity.id
+            );
+
+            // Find our PaymentOrder
+
+            const paymentOrder =
+                await PaymentOrder.findOne({
+                    razorpayOrderId
+                });
+
+            if (paymentOrder) {
+
+                paymentOrder.status = "FAILED";
+
+                await paymentOrder.save();
+            }
+
+            res.status(200).json({
+                message: "Payment failure webhook processed."
+            });
+
+            return;
+        }
+
+        // =====================================================
+        // OTHER EVENTS
+        // =====================================================
+
+        res.status(200).json({
+            message: "Webhook received successfully."
+        });
+
+    } catch (error) {
+
+        // Rollback if transaction was started
+
+        if (session.inTransaction()) {
+            await session.abortTransaction();
+        }
+
+        console.error(
+            "Razorpay webhook error:",
+            error
+        );
+
+        res.status(500).json({
+            message: "Webhook processing failed."
+        });
+
+    } finally {
+
+        await session.endSession();
+    }
+};
+

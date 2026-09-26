@@ -7,7 +7,14 @@ import paymentRouter from "./routes/payment.routes"
 dotenv.config();
 
 const app = express()
-app.use(express.json())
+
+app.use(
+    express.json({
+        verify: (req, res, buf) => {
+            (req as any).rawBody = buf;
+        }
+    })
+);
 
 app.use("/api/auth", authRoutes)
 app.use("/api/wallet", walletRouter)
