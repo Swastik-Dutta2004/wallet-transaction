@@ -3,7 +3,6 @@ import { Request, Response } from "express"
 import userModel from "../models/user.models"
 import walletModel from "../models/wallet.models"
 import bcrypt from "bcrypt"
-import { AuthRequest } from "../middleware/auth.middleware"
 import jwt from "jsonwebtoken"
 
 
@@ -21,19 +20,21 @@ export const registerUser = async (
         return
     }
 
-    const existingUser = await userModel.findOne({ email })
-
-    if (existingUser) {
-
-        res.status(409).json({
-            message: "User already exists"
-        })
-        return
-    }
-
-    const session = await mongoose.startSession()
+    let session: mongoose.ClientSession | undefined
 
     try {
+
+        const existingUser = await userModel.findOne({ email })
+
+        if (existingUser) {
+
+            res.status(409).json({
+                message: "User already exists"
+            })
+            return
+        }
+
+        session = await mongoose.startSession()
 
         session.startTransaction()
 
@@ -63,7 +64,7 @@ export const registerUser = async (
 
         await session.commitTransaction()
 
-        res.status(200).json({
+        res.status(201).json({
             message: "User registered successfully.",
             user: {
                 id: User._id,
@@ -78,9 +79,19 @@ export const registerUser = async (
         })
     } catch (error) {
 
-        await session.abortTransaction()
+        if (session?.inTransaction()) {
+            await session.abortTransaction()
+        }
 
         console.log("Registration error: ", error)
+
+        if ((error as { code?: number })?.code === 11000) {
+
+            res.status(409).json({
+                message: "User already exists"
+            })
+            return
+        }
 
         res.status(500).json({
             message: "Internal server error."
@@ -89,7 +100,7 @@ export const registerUser = async (
     }
 
     finally {
-        session.endSession()
+        await session?.endSession()
     }
 }
 

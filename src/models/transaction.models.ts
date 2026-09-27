@@ -1,5 +1,4 @@
 import mongoose, { Schema, Document, Types } from "mongoose"
-import walletModel from "./wallet.models";
 
 export interface ITransaction extends Document {
     walletId: Types.ObjectId,

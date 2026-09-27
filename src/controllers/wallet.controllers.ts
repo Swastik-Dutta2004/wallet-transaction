@@ -15,8 +15,8 @@ export const getWallet = async (
         const userId = req.user?.userId;
 
         if (!userId) {
-            res.status(400).json({
-                message: "User ID required."
+            res.status(401).json({
+                message: "User is not authenticated."
             })
             return
         }
@@ -54,19 +54,15 @@ export const addMoney = async (
     res: Response
 ): Promise<void> => {
 
-    const session = await mongoose.startSession()
+    let session: mongoose.ClientSession | undefined
 
     try {
-
-        session.startTransaction()
 
         const { amount } = req.body
 
         const idempotencyKey = req.headers["idempotency-key"]
 
         if (!idempotencyKey || typeof idempotencyKey !== "string") {
-
-            await session.abortTransaction()
 
             res.status(400).json({
                 message: "Idempotency-Key header is required."
@@ -75,6 +71,44 @@ export const addMoney = async (
             return
         }
 
+        // Get user ID from JWT
+        const userId = req.user?.userId
+
+        if (!userId) {
+
+            res.status(401).json({
+                message: "User is not authenticated."
+            })
+
+            return
+        }
+
+        // Validate amount
+        if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) {
+
+            res.status(400).json({
+                message: "Amount must be greater than 0."
+            })
+
+            return
+        }
+
+        // Convert rupees to paise
+        const amountInPaise = Math.round(amount * 100)
+
+        // Reject amounts that round down to zero paise
+        if (amountInPaise < 1) {
+
+            res.status(400).json({
+                message: "Amount must be at least 0.01."
+            })
+
+            return
+        }
+
+        session = await mongoose.startSession()
+
+        session.startTransaction()
 
         const existingTransaction = await transactionModel.findOne({
             idempotencyKey
@@ -95,37 +129,6 @@ export const addMoney = async (
 
             return
         }
-
-
-        // Get user ID from JWT
-        const userId = req.user?.userId
-
-        // Validate user and amount
-        if (!userId || amount === undefined) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "User ID and amount are required."
-            })
-
-            return
-        }
-
-        // Validate amount
-        if (typeof amount !== "number" || amount <= 0) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Amount must be greater than 0."
-            })
-
-            return
-        }
-
-        // Convert rupees to paise
-        const amountInPaise = Math.round(amount * 100)
 
         // Find wallet using logged-in user's ID
         const wallet = await walletModel.findOne({
@@ -210,7 +213,9 @@ export const addMoney = async (
 
     } catch (error) {
 
-        await session.abortTransaction()
+        if (session?.inTransaction()) {
+            await session.abortTransaction()
+        }
 
         console.log("Add money error:", error)
 
@@ -220,7 +225,7 @@ export const addMoney = async (
 
     } finally {
 
-        session.endSession()
+        await session?.endSession()
 
     }
 }
@@ -231,22 +236,18 @@ export const transferMoney = async (
     res: Response
 ): Promise<void> => {
 
-    const session = await mongoose.startSession()
+    let session: mongoose.ClientSession | undefined
 
     try {
 
-        session.startTransaction()
-
         const { receiverId, amount } = req.body
 
-        const idempotencyKey = req.headers["idempotency-key"]   
+        const idempotencyKey = req.headers["idempotency-key"]
 
         // Get sender ID from JWT
         const senderId = req.user?.userId
-        
 
         if (!idempotencyKey || typeof idempotencyKey !== "string") {
-            await session.abortTransaction()
 
             res.status(400).json({
                 message: "Idempotency-Key header is required."
@@ -259,18 +260,14 @@ export const transferMoney = async (
         // Validate input
         if (!senderId) {
 
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Sender ID required."
+            res.status(401).json({
+                message: "User is not authenticated."
             })
 
             return
         }
 
-        if (!receiverId) {
-
-            await session.abortTransaction()
+        if (!receiverId || typeof receiverId !== "string") {
 
             res.status(400).json({
                 message: "Receiver ID required."
@@ -279,33 +276,17 @@ export const transferMoney = async (
             return
         }
 
-        if (amount === undefined) {
-
-            await session.abortTransaction()
+        if (!mongoose.isValidObjectId(receiverId)) {
 
             res.status(400).json({
-                message: " amount is required."
-            })
-
-            return
-        }
-
-        // Sender and receiver cannot be the same
-        if (senderId === receiverId) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Sender and receiver cannot be the same."
+                message: "Receiver ID is invalid."
             })
 
             return
         }
 
         // Validate amount
-        if (typeof amount !== "number" || amount <= 0) {
-
-            await session.abortTransaction()
+        if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) {
 
             res.status(400).json({
                 message: "Amount must be greater than 0."
@@ -316,6 +297,42 @@ export const transferMoney = async (
 
         // Convert rupees to paise
         const amountInPaise = Math.round(amount * 100)
+
+        // Reject amounts that round down to zero paise
+        if (amountInPaise < 1) {
+
+            res.status(400).json({
+                message: "Amount must be at least 0.01."
+            })
+
+            return
+        }
+
+        session = await mongoose.startSession()
+
+        session.startTransaction()
+
+        // Idempotency is checked first so replays return the original
+        // result instead of failing on the balance check below
+        const existingTransaction = await transactionModel.findOne({
+            idempotencyKey
+        }).session(session)
+
+        if (existingTransaction) {
+            await session.abortTransaction()
+
+            res.status(200).json({
+                message: "Request already processed.",
+                transaction: {
+                    id: existingTransaction._id,
+                    type: existingTransaction.type,
+                    amount: existingTransaction.amount,
+                    status: existingTransaction.status
+                }
+            })
+
+            return
+        }
 
         // Find sender wallet
         const senderWallet = await walletModel.findOne({
@@ -349,6 +366,20 @@ export const transferMoney = async (
             return
         }
 
+        // Sender and receiver cannot be the same.
+        // Compared as ObjectIds so casing/format differences on the
+        // receiver id cannot bypass the check.
+        if (String(senderWallet._id) === String(receiverWallet._id)) {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Sender and receiver cannot be the same."
+            })
+
+            return
+        }
+
         // Check wallet status
         if (
             senderWallet.status !== "active" ||
@@ -364,6 +395,18 @@ export const transferMoney = async (
             return
         }
 
+        // Both sides must settle in the same currency
+        if (senderWallet.currency !== receiverWallet.currency) {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Both wallets must use the same currency."
+            })
+
+            return
+        }
+
         // Check sender balance
         if (senderWallet.balance < amountInPaise) {
 
@@ -371,28 +414,6 @@ export const transferMoney = async (
 
             res.status(400).json({
                 message: "Insufficient wallet balance."
-            })
-
-            return
-        }
-
-        
-        const existingTransaction = await transactionModel.findOne({
-            idempotencyKey
-        }).session(session)
-
-
-        if (existingTransaction) {
-            await session.abortTransaction()
-
-            res.status(200).json({
-                message: "Request already processed.",
-                transaction: {
-                    id: existingTransaction._id,
-                    type: existingTransaction.type,
-                    amount: existingTransaction.amount,
-                    status: existingTransaction.status
-                }
             })
 
             return
@@ -476,7 +497,9 @@ export const transferMoney = async (
 
     } catch (error) {
 
-        await session.abortTransaction()
+        if (session?.inTransaction()) {
+            await session.abortTransaction()
+        }
 
         console.log("Transfer error:", error)
 
@@ -486,7 +509,7 @@ export const transferMoney = async (
 
     } finally {
 
-        session.endSession()
+        await session?.endSession()
 
     }
 }

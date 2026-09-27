@@ -34,7 +34,11 @@ export const createOrder = async (
         }
 
         // Validate amount
-        if (!amount || amount <= 0) {
+        if (
+            typeof amount !== "number" ||
+            !Number.isFinite(amount) ||
+            amount <= 0
+        ) {
             res.status(400).json({
                 message: "Amount must be greater than 0."
             });
@@ -49,9 +53,22 @@ export const createOrder = async (
             return;
         }
 
-        // Check if this request was already processed
+        // Convert INR to paise
+        const amountInPaise = Math.round(amount * 100);
+
+        if (amountInPaise < 1) {
+            res.status(400).json({
+                message: "Amount must be at least 0.01."
+            });
+            return;
+        }
+
+        // Check if this request was already processed.
+        // Scoped to the authenticated user so a shared or guessable key
+        // cannot surface another user's order details.
         const existingPaymentOrder = await PaymentOrder.findOne({
-            idempotencyKey
+            idempotencyKey,
+            userId
         });
 
         if (existingPaymentOrder) {
@@ -67,14 +84,11 @@ export const createOrder = async (
             return;
         }
 
-        // Convert INR to paise
-        const amountInPaise = Math.round(amount * 100);
-
         // Create order on Razorpay
         const order = await razorpay.orders.create({
             amount: amountInPaise,
             currency: "INR",
-            receipt: `receipt_${Date.now()}`
+            receipt: `receipt_${idempotencyKey}`
         });
 
         // Save Razorpay order in our database
@@ -115,9 +129,10 @@ export const verifyPayment = async (
     res: Response
 ): Promise<void> => {
 
-    const session = await mongoose.startSession();
+    let session: mongoose.ClientSession | undefined
 
     try {
+
         const userId = req.user?.userId;
 
         const {
@@ -125,7 +140,6 @@ export const verifyPayment = async (
             razorpay_payment_id,
             razorpay_signature
         } = req.body;
-
         // 1. Check authenticated user
         if (!userId) {
             res.status(401).json({
@@ -165,7 +179,16 @@ export const verifyPayment = async (
             .update(body)
             .digest("hex");
 
-        if (expectedSignature !== razorpay_signature) {
+        const providedBuffer = Buffer.from(
+            String(razorpay_signature)
+        );
+
+        const expectedBuffer = Buffer.from(expectedSignature);
+
+        if (
+            providedBuffer.length !== expectedBuffer.length ||
+            !crypto.timingSafeEqual(providedBuffer, expectedBuffer)
+        ) {
             res.status(400).json({
                 message: "Payment verification failed."
             });
@@ -190,6 +213,15 @@ export const verifyPayment = async (
         if (paymentOrder.userId.toString() !== userId) {
             res.status(403).json({
                 message: "This payment order does not belong to this user."
+            });
+            return;
+        }
+
+        // An order already marked FAILED must not be credited
+
+        if (paymentOrder.status === "FAILED") {
+            res.status(400).json({
+                message: "Payment order has already failed."
             });
             return;
         }
@@ -224,6 +256,8 @@ export const verifyPayment = async (
         }
 
         // 9. Start MongoDB transaction
+
+        session = await mongoose.startSession();
 
         session.startTransaction();
 
@@ -283,6 +317,11 @@ export const verifyPayment = async (
             amount: paymentOrder.amount,
             currency: paymentOrder.currency,
             status: "Success",
+
+            // Reuse the PaymentOrder idempotency key so this write is
+            // deduped against the webhook credit path for the same order
+            idempotencyKey: paymentOrder.idempotencyKey,
+
             description: "Money added through Razorpay"
         });
 
@@ -329,7 +368,9 @@ export const verifyPayment = async (
 
     } catch (error) {
 
-        await session.abortTransaction();
+        if (session?.inTransaction()) {
+            await session.abortTransaction();
+        }
 
         console.error("Payment verification error:", error);
 
@@ -338,10 +379,9 @@ export const verifyPayment = async (
         });
 
     } finally {
-        session.endSession();
+        await session?.endSession();
     }
 };
-
 
 
 export const handleWebhook = async (
@@ -349,7 +389,7 @@ export const handleWebhook = async (
     res: Response
 ): Promise<void> => {
 
-    const session = await mongoose.startSession();
+    let session: mongoose.ClientSession | undefined
 
     try {
 
@@ -370,10 +410,7 @@ export const handleWebhook = async (
         const razorpaySignature =
             req.headers["x-razorpay-signature"];
 
-        if (
-            !razorpaySignature ||
-            typeof razorpaySignature !== "string"
-        ) {
+        if (!razorpaySignature || typeof razorpaySignature !== "string") {
             res.status(400).json({
                 message: "Webhook signature is missing."
             });
@@ -400,7 +437,14 @@ export const handleWebhook = async (
 
         // 5. Verify webhook signature
 
-        if (expectedSignature !== razorpaySignature) {
+        const providedBuffer = Buffer.from(razorpaySignature);
+
+        const expectedBuffer = Buffer.from(expectedSignature);
+
+        if (
+            providedBuffer.length !== expectedBuffer.length ||
+            !crypto.timingSafeEqual(providedBuffer, expectedBuffer)
+        ) {
             res.status(400).json({
                 message: "Invalid webhook signature."
             });
@@ -432,17 +476,13 @@ export const handleWebhook = async (
                 return;
             }
 
-            const razorpayPaymentId =
-                paymentEntity.id;
+            const razorpayPaymentId = paymentEntity.id;
 
-            const razorpayOrderId =
-                paymentEntity.order_id;
+            const razorpayOrderId = paymentEntity.order_id;
 
-            const amount =
-                paymentEntity.amount;
+            const amount = paymentEntity.amount;
 
-            const currency =
-                paymentEntity.currency;
+            const currency = paymentEntity.currency;
 
             // 6. Find our PaymentOrder
 
@@ -496,16 +536,15 @@ export const handleWebhook = async (
             // START MONGODB TRANSACTION
             // =================================================
 
+            session = await mongoose.startSession();
+
             session.startTransaction();
 
             // 10. Re-check inside transaction
             // Protects against simultaneous webhook requests
 
             const existingTransaction =
-                await Transaction.findOne({
-                    idempotencyKey:
-                        paymentOrder.idempotencyKey
-                }).session(session);
+                await Transaction.findOne({ idempotencyKey: paymentOrder.idempotencyKey }).session(session);
 
             if (existingTransaction) {
 
@@ -520,10 +559,7 @@ export const handleWebhook = async (
 
             // 11. Find user's wallet
 
-            const wallet =
-                await Wallet.findOne({
-                    ownerId: paymentOrder.userId
-                }).session(session);
+            const wallet = await Wallet.findOne({ ownerId: paymentOrder.userId }).session(session);
 
             if (!wallet) {
 
@@ -551,19 +587,15 @@ export const handleWebhook = async (
 
             // 13. Store balance before
 
-            const balanceBefore =
-                wallet.balance;
+            const balanceBefore = wallet.balance;
 
             // 14. Credit wallet
 
             wallet.balance += paymentOrder.amount;
 
-            const balanceAfter =
-                wallet.balance;
+            const balanceAfter = wallet.balance;
 
-            await wallet.save({
-                session
-            });
+            await wallet.save({ session });
 
             // 15. Create Payment
 
@@ -577,9 +609,7 @@ export const handleWebhook = async (
                 status: "SUCCESS"
             });
 
-            await payment.save({
-                session
-            });
+            await payment.save({ session });
 
             // 16. Create Transaction
 
@@ -594,11 +624,9 @@ export const handleWebhook = async (
                 // Reuse the idempotency key
                 // from PaymentOrder
 
-                idempotencyKey:
-                    paymentOrder.idempotencyKey,
+                idempotencyKey: paymentOrder.idempotencyKey,
 
-                description:
-                    "Money added through Razorpay webhook"
+                description: "Money added through Razorpay webhook"
             });
 
             await transaction.save({
@@ -705,7 +733,7 @@ export const handleWebhook = async (
 
         // Rollback if transaction was started
 
-        if (session.inTransaction()) {
+        if (session?.inTransaction()) {
             await session.abortTransaction();
         }
 
@@ -720,7 +748,71 @@ export const handleWebhook = async (
 
     } finally {
 
-        await session.endSession();
+        await session?.endSession();
+    }
+};
+
+
+export const getPaymentStatus = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+    try {
+        // 1. Get authenticated user
+        const userId = req.user?.userId;
+
+        if (!userId) {
+            res.status(401).json({
+                message: "User is not authenticated."
+            });
+            return;
+        }
+
+        // 2. Get Razorpay order ID from URL
+        const { orderId } = req.params;
+
+        if (!orderId) {
+            res.status(400).json({
+                message: "Order ID is required."
+            });
+            return;
+        }
+
+        // 3. Find payment order
+        const paymentOrder = await PaymentOrder.findOne({
+            razorpayOrderId: orderId,
+            userId
+        });
+
+        if (!paymentOrder) {
+            res.status(404).json({
+                message: "Payment order not found."
+            });
+            return;
+        }
+
+        // 4. Return payment status
+        res.status(200).json({
+            message: "Payment status fetched successfully.",
+            payment: {
+                orderId: paymentOrder.razorpayOrderId,
+                amount: paymentOrder.amount,
+                currency: paymentOrder.currency,
+                status: paymentOrder.status,
+                createdAt: paymentOrder.createdAt,
+                updatedAt: paymentOrder.updatedAt
+            }
+        });
+
+    } catch (error) {
+        console.error(
+            "Get payment status error:",
+            error
+        );
+
+        res.status(500).json({
+            message: "Failed to fetch payment status."
+        });
     }
 };
 

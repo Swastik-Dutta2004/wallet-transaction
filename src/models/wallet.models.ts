@@ -36,6 +36,8 @@ const walletSchema = new Schema<IWallet>({
         enum: ["active", "frozen"],
         default: "active"
     }
+}, {
+    timestamps: true
 })
 
 const walletModel = mongoose.model("Wallet", walletSchema)

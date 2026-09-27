@@ -1,4 +1,4 @@
-import mongoose, {Document, Types, Schema, mongo} from "mongoose"
+import mongoose, {Document, Types, Schema} from "mongoose"
 
 export interface ILedger extends Document{
     walletId: Types.ObjectId;
