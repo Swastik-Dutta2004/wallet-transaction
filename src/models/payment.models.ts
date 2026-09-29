@@ -10,6 +10,14 @@ export interface IPayment extends Document {
     amount: number;
     currency: string;
 
+    // Running total of refunds already applied to this payment, in paise.
+    // Partial refunds are supported, so `status` deliberately stays
+    // "SUCCESS" and is never flipped to "REFUNDED". This field is the
+    // source of truth for "how much is still refundable" and is the field
+    // the atomic over-refund guard increments, so the cap cannot be
+    // raced past by two concurrent refund requests.
+    refundedAmount: number;
+
     status: "SUCCESS" | "FAILED";
 
     createdAt: Date;
@@ -51,6 +59,13 @@ const paymentSchema = new Schema<IPayment>(
             type: String,
             required: true,
             default: "INR"
+        },
+
+        refundedAmount: {
+            type: Number,
+            required: true,
+            default: 0,
+            min: 0
         },
 
         status: {

@@ -10,6 +10,7 @@ import Transaction from "../models/transaction.models";
 import Ledger from "../models/ledger.models";
 import { AuthRequest } from "../middleware/auth.middleware"
 import PaymentOrder from "../models/payment-order.models"
+import Refund from "../models/refund.models"
 
 const razorpay = new Razorpay({
     key_id: process.env.RAZORPAY_KEY_ID!,
@@ -813,6 +814,574 @@ export const getPaymentStatus = async (
         res.status(500).json({
             message: "Failed to fetch payment status."
         });
+    }
+};
+
+
+// Razorpay status values are lowercase and use their own words,
+// for example "pending" or "processed".
+// Our Refund model uses uppercase, so they are mapped explicitly
+// instead of being stored as an unknown value.
+const mapRazorpayRefundStatus = (
+    razorpayStatus: string
+): "PROCESSED" | "FAILED" => {
+
+    return razorpayStatus === "processed" ? "PROCESSED" : "FAILED";
+};
+    
+
+// Writes a FAILED Refund row OUTSIDE any MongoDB transaction.
+//
+// This exists for one specific situation: Razorpay already created the
+// refund, but our database work afterwards failed.
+//
+// A MongoDB rollback can never undo a refund that Razorpay has already
+// processed, so pretending the request simply failed would leave the
+// wallet credited while the customer has already been made whole.
+// Instead we keep a durable FAILED row containing the razorpayRefundId,
+// which is the reconciliation trail for a human to follow up on.
+//
+// The row is written WITHOUT a session on purpose, because the
+// transaction that failed must not be reused.
+//
+// A FAILED row does not count towards the refundable total, but it does
+// occupy the idempotencyKey (unique index). That is deliberate: a client
+// retrying the same key gets the FAILED refund back rather than silently
+// triggering a SECOND real refund at Razorpay.
+const recordFailedRefund = async (details: {
+    userId: string;
+    paymentId: string;
+    razorpayPaymentId: string;
+    razorpayRefundId: string;
+    amount: number;
+    currency: string;
+    idempotencyKey: string;
+    reason?: string;
+    failureReason: string;
+}): Promise<void> => {
+
+    try {
+        await Refund.create({
+            userId: details.userId,
+            paymentId: details.paymentId,
+            razorpayPaymentId: details.razorpayPaymentId,
+            razorpayRefundId: details.razorpayRefundId,
+            amount: details.amount,
+            currency: details.currency,
+            status: "FAILED",
+            idempotencyKey: details.idempotencyKey,
+            reason: details.reason,
+            failureReason: details.failureReason
+        });
+    } catch (recordError) {
+        // The reconciliation row itself failed. Swallow it so the
+        // original error is not masked, but log loudly, because the only
+        // remaining trace of this refund is now the log line below.
+        console.error(
+            "CRITICAL: could not record FAILED refund row. " +
+            "This refund is only traceable via logs.",
+            {
+                idempotencyKey: details.idempotencyKey,
+                razorpayRefundId: details.razorpayRefundId,
+                razorpayPaymentId: details.razorpayPaymentId,
+                error: recordError
+            }
+        );
+    }
+};
+
+
+export const createRefund = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+
+    const { paymentId, amount, reason } = req.body;
+
+    const rawIdempotencyKey = req.headers["idempotency-key"];
+
+    // 1. Check authenticated user
+
+    const userId = req.user?.userId;
+
+    if (!userId) {
+        res.status(401).json({
+            message: "User is not authenticated."
+        });
+        return;
+    }
+
+    // 2. Validate the Idempotency-Key header.
+    // Done before the try block so it stays a plain string in the catch
+    // block below, where TypeScript narrowing does not carry over.
+
+    if (!rawIdempotencyKey || typeof rawIdempotencyKey !== "string") {
+        res.status(400).json({
+            message: "Idempotency-Key header is required."
+        });
+        return;
+    }
+
+    const idempotencyKey = rawIdempotencyKey;
+
+    // Values captured now so the FAILED Refund row can be written later,
+    // even if the transaction below rolls back
+    let razorpayRefundId: string | undefined;
+
+    let refundAmountInPaise = 0;
+
+    let session: mongoose.ClientSession | undefined;
+
+    try {
+
+        // 3. Validate paymentId
+
+        if (!paymentId || !mongoose.isValidObjectId(paymentId)) {
+            res.status(400).json({
+                message: "A valid paymentId is required."
+            });
+            return;
+        }
+
+        // 4. Validate amount.
+        // The frontend sends RUPEES, we store and send PAISA.
+
+        if (
+            typeof amount !== "number" ||
+            !Number.isFinite(amount) ||
+            amount <= 0
+        ) {
+            res.status(400).json({
+                message: "Amount must be greater than 0."
+            });
+            return;
+        }
+
+        refundAmountInPaise = Math.round(amount * 100);
+
+        if (refundAmountInPaise < 1) {
+            res.status(400).json({
+                message: "Amount must be at least 0.01."
+            });
+            return;
+        }
+
+        // 5. Idempotency replay.
+        // Checked before anything else so a retried request never reaches
+        // Razorpay a second time.
+
+        const existingRefund = await Refund.findOne({
+            idempotencyKey
+        });
+
+        if (existingRefund) {
+            res.status(200).json({
+                message: "Request already processed.",
+                refund: {
+                    id: existingRefund._id,
+                    razorpayRefundId: existingRefund.razorpayRefundId,
+                    paymentId: existingRefund.paymentId,
+                    amount: existingRefund.amount,
+                    currency: existingRefund.currency,
+                    status: existingRefund.status
+                }
+            });
+            return;
+        }
+
+        // 6. Find the Payment. The stored Payment is the source of truth
+        // for the original amount, we never trust the frontend for it.
+
+        const payment = await Payment.findOne({
+            _id: paymentId
+        });
+
+        if (!payment) {
+            res.status(404).json({
+                message: "Payment not found."
+            });
+            return;
+        }
+
+        // 7. The Payment must belong to the authenticated user
+
+        if (payment.userId.toString() !== userId) {
+            res.status(403).json({
+                message: "This payment does not belong to you."
+            });
+            return;
+        }
+
+        // 8. Only a successful payment can be refunded.
+        // status stays "SUCCESS" even after a partial refund, so this
+        // check does not block later partial refunds.
+
+        if (payment.status !== "SUCCESS") {
+            res.status(400).json({
+                message: "Only a successful payment can be refunded."
+            });
+            return;
+        }
+
+        // 9. Friendly pre-check on the refundable amount.
+        // NOT authoritative, see step 12 for the real guard.
+
+        const alreadyRefunded = payment.refundedAmount ?? 0;
+
+        const refundableAmount = payment.amount - alreadyRefunded;
+
+        if (refundAmountInPaise > refundableAmount) {
+            res.status(409).json({
+                message:
+                    "Refund exceeds the remaining refundable amount.",
+                paymentAmount: payment.amount,
+                alreadyRefunded,
+                refundableAmount
+            });
+            return;
+        }
+
+        // =====================================================
+        // 10. CALL RAZORPAY
+        //
+        // This is an EXTERNAL network call, so it is deliberately made
+        // BEFORE the MongoDB transaction opens and is never placed
+        // inside one. Holding a transaction open across a network
+        // round trip is what causes long running transactions and
+        // snapshot write conflicts.
+        //
+        // If this throws, nothing has been written to MongoDB yet and
+        // there is nothing to undo.
+        // =====================================================
+
+        let razorpayRefund;
+
+        try {
+            razorpayRefund = await razorpay.payments.refund(
+                payment.razorpayPaymentId,
+                {
+                    amount: refundAmountInPaise
+                }
+            );
+        } catch (razorpayError) {
+            // Log the detail, never send it to the client, so the
+            // Razorpay secret and internal messages stay server side
+            console.error(
+                "Razorpay refund API call failed:",
+                razorpayError
+            );
+
+            res.status(500).json({
+                message: "Failed to process the refund with Razorpay."
+            });
+            return;
+        }
+
+        razorpayRefundId = razorpayRefund.id;
+
+        // Razorpay accepted the refund, so from here on any failure is
+        // the reconciliation case described in recordFailedRefund
+        console.log(
+            "Razorpay refund created:",
+            {
+                razorpayRefundId,
+                razorpayPaymentId: payment.razorpayPaymentId,
+                amount: refundAmountInPaise,
+                status: razorpayRefund.status
+            }
+        );
+
+        // =====================================================
+        // START MONGODB TRANSACTION
+        // =====================================================
+
+        session = await mongoose.startSession();
+
+        session.startTransaction();
+
+        // 11. ATOMIC CAP CLAIM. This is the authoritative guard against
+        // two concurrent refunds over-refunding the same payment.
+        //
+        // The filter and the $inc are applied as ONE atomic operation.
+        // The $expr condition re-checks the cap against the value the
+        // $inc is about to produce, so a request that would push the
+        // total past payment.amount matches nothing and returns null.
+        //
+        // If the claim fails we abort WITHOUT touching the wallet, so a
+        // losing racer can never debit the customer for a refund that
+        // was not allowed.
+
+        const claimedPayment = await Payment.findOneAndUpdate(
+            {
+                _id: payment._id,
+                userId: payment.userId,
+                status: "SUCCESS",
+                $expr: {
+                    $lte: [
+                        {
+                            $add: [
+                                // $ifNull guards payments stored before
+                                // refundedAmount existed. A missing field
+                                // evaluates to null inside an aggregation
+                                // expression, not 0, so it is coerced
+                                // explicitly here.
+                                { $ifNull: ["$refundedAmount", 0] },
+                                refundAmountInPaise
+                            ]
+                        },
+                        "$amount"
+                    ]
+                }
+            },
+            {
+                $inc: { refundedAmount: refundAmountInPaise }
+            },
+            { new: true, session }
+        );
+
+        if (!claimedPayment) {
+
+            await session.abortTransaction();
+
+            console.error(
+                "CRITICAL: refund cap was exceeded during the " +
+                "transaction. Razorpay already refunded this amount but " +
+                "the wallet was NOT debited. Manual reconciliation needed.",
+                {
+                    razorpayRefundId,
+                    razorpayPaymentId: payment.razorpayPaymentId,
+                    paymentId: payment._id.toString(),
+                    requestedAmount: refundAmountInPaise,
+                    idempotencyKey
+                }
+            );
+
+            await recordFailedRefund({
+                userId,
+                paymentId: payment._id.toString(),
+                razorpayPaymentId: payment.razorpayPaymentId,
+                razorpayRefundId,
+                amount: refundAmountInPaise,
+                currency: payment.currency,
+                idempotencyKey,
+                reason,
+                failureReason:
+                    "Refund cap exceeded at commit time (concurrent request)"
+            });
+
+            res.status(409).json({
+                message:
+                    "Refund exceeds the remaining refundable amount."
+            });
+            return;
+        }
+
+        // 12. Find the user's wallet
+
+        const wallet = await Wallet.findOne({
+            ownerId: userId
+        }).session(session);
+
+        if (!wallet) {
+
+            await session.abortTransaction();
+
+            await recordFailedRefund({
+                userId,
+                paymentId: payment._id.toString(),
+                razorpayPaymentId: payment.razorpayPaymentId,
+                razorpayRefundId,
+                amount: refundAmountInPaise,
+                currency: payment.currency,
+                idempotencyKey,
+                reason,
+                failureReason: "Wallet not found"
+            });
+
+            res.status(404).json({
+                message: "Wallet not found."
+            });
+            return;
+        }
+
+        // 13. Check the wallet can absorb the debit
+
+        if (wallet.status !== "active") {
+
+            await session.abortTransaction();
+
+            await recordFailedRefund({
+                userId,
+                paymentId: payment._id.toString(),
+                razorpayPaymentId: payment.razorpayPaymentId,
+                razorpayRefundId,
+                amount: refundAmountInPaise,
+                currency: payment.currency,
+                idempotencyKey,
+                reason,
+                failureReason: "Wallet is not active"
+            });
+
+            res.status(400).json({
+                message: "Wallet is not active."
+            });
+            return;
+        }
+
+        if (wallet.balance < refundAmountInPaise) {
+
+            await session.abortTransaction();
+
+            await recordFailedRefund({
+                userId,
+                paymentId: payment._id.toString(),
+                razorpayPaymentId: payment.razorpayPaymentId,
+                razorpayRefundId,
+                amount: refundAmountInPaise,
+                currency: payment.currency,
+                idempotencyKey,
+                reason,
+                failureReason: "Insufficient wallet balance"
+            });
+
+            res.status(400).json({
+                message: "Insufficient wallet balance."
+            });
+            return;
+        }
+
+        // 14. Debit the wallet
+
+        const balanceBefore = wallet.balance;
+
+        wallet.balance -= refundAmountInPaise;
+
+        const balanceAfter = wallet.balance;
+
+        await wallet.save({ session });
+
+        // 15. Create the Refund record
+
+        const refund = new Refund({
+            userId,
+            paymentId: payment._id,
+            razorpayPaymentId: payment.razorpayPaymentId,
+            razorpayRefundId,
+            amount: refundAmountInPaise,
+            currency: payment.currency,
+            status: mapRazorpayRefundStatus(razorpayRefund.status),
+            idempotencyKey,
+            reason
+        });
+
+        await refund.save({ session });
+
+        // 16. Create the DEBIT Transaction
+
+        const transaction = new Transaction({
+            walletId: wallet._id,
+            type: "DEBIT",
+            amount: refundAmountInPaise,
+            currency: payment.currency,
+            status: "Success",
+            idempotencyKey,
+            description: "Refund for Razorpay payment"
+        });
+
+        await transaction.save({ session });
+
+        // 17. Create the DEBIT Ledger
+
+        const ledger = new Ledger({
+            walletId: wallet._id,
+            transactionId: transaction._id,
+            type: "DEBIT",
+            amount: refundAmountInPaise,
+            balanceBefore,
+            balanceAfter,
+            currency: payment.currency,
+            description: "Razorpay payment refund"
+        });
+
+        await ledger.save({ session });
+
+        // 18. Commit everything
+
+        await session.commitTransaction();
+
+        res.status(200).json({
+            message: "Refund processed successfully.",
+            refund: {
+                id: refund._id,
+                razorpayRefundId: refund.razorpayRefundId,
+                paymentId: refund.paymentId,
+                razorpayPaymentId: refund.razorpayPaymentId,
+                amount: refund.amount,
+                currency: refund.currency,
+                status: refund.status
+            },
+            wallet: {
+                id: wallet._id,
+                balance: wallet.balance,
+                currency: wallet.currency
+            },
+            payment: {
+                amount: payment.amount,
+                refundedAmount: claimedPayment.refundedAmount,
+                refundableAmount:
+                    claimedPayment.amount - claimedPayment.refundedAmount
+            }
+        });
+
+    } catch (error) {
+
+        // Only failures that happen AFTER Razorpay succeeded need a
+        // FAILED reconciliation row. If we never reached Razorpay, there
+        // is nothing external to reconcile.
+        if (razorpayRefundId) {
+
+            if (session?.inTransaction()) {
+                await session.abortTransaction();
+            }
+
+            console.error(
+                "CRITICAL: Razorpay refund succeeded but the MongoDB " +
+                "transaction failed. The wallet was NOT debited and the " +
+                "customer HAS been refunded at Razorpay. Manual " +
+                "reconciliation is required.",
+                {
+                    razorpayRefundId,
+                    paymentId,
+                    idempotencyKey,
+                    amount: refundAmountInPaise,
+                    error
+                }
+            );
+
+            const payment = await Payment.findById(paymentId).lean();
+
+            await recordFailedRefund({
+                userId: String(req.user?.userId),
+                paymentId: String(paymentId),
+                razorpayPaymentId: payment?.razorpayPaymentId ?? "",
+                razorpayRefundId,
+                amount: refundAmountInPaise,
+                currency: payment?.currency ?? "INR",
+                idempotencyKey,
+                reason,
+                failureReason: "MongoDB transaction failed after refund"
+            });
+        }
+
+        console.error("Create refund error:", error);
+
+        res.status(500).json({
+            message: "Failed to process the refund."
+        });
+
+    } finally {
+
+        await session?.endSession();
     }
 };
 
