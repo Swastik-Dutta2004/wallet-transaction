@@ -828,7 +828,7 @@ const mapRazorpayRefundStatus = (
 
     return razorpayStatus === "processed" ? "PROCESSED" : "FAILED";
 };
-    
+
 
 // Writes a FAILED Refund row OUTSIDE any MongoDB transaction.
 //
@@ -946,11 +946,7 @@ export const createRefund = async (
         // 4. Validate amount.
         // The frontend sends RUPEES, we store and send PAISA.
 
-        if (
-            typeof amount !== "number" ||
-            !Number.isFinite(amount) ||
-            amount <= 0
-        ) {
+        if (typeof amount !== "number" || Number.isFinite(amount) || amount <= 0) {
             res.status(400).json({
                 message: "Amount must be greater than 0."
             });
@@ -963,7 +959,7 @@ export const createRefund = async (
             res.status(400).json({
                 message: "Amount must be at least 0.01."
             });
-            return;
+            return; 
         }
 
         // 5. Idempotency replay.
@@ -1064,8 +1060,10 @@ export const createRefund = async (
                 }
             );
         } catch (razorpayError) {
+
             // Log the detail, never send it to the client, so the
             // Razorpay secret and internal messages stay server side
+
             console.error(
                 "Razorpay refund API call failed:",
                 razorpayError
@@ -1081,6 +1079,7 @@ export const createRefund = async (
 
         // Razorpay accepted the refund, so from here on any failure is
         // the reconciliation case described in recordFailedRefund
+        
         console.log(
             "Razorpay refund created:",
             {
@@ -1128,8 +1127,8 @@ export const createRefund = async (
                                 { $ifNull: ["$refundedAmount", 0] },
                                 refundAmountInPaise
                             ]
-                        },
-                        "$amount"
+                        },  
+                            
                     ]
                 }
             },

@@ -13,7 +13,7 @@ export interface IPayment extends Document {
     // Running total of refunds already applied to this payment, in paise.
     // Partial refunds are supported, so `status` deliberately stays
     // "SUCCESS" and is never flipped to "REFUNDED". This field is the
-    // source of truth for "how much is still refundable" and is the field
+    // source of tru    th for "how much is still refundable" and is the field
     // the atomic over-refund guard increments, so the cap cannot be
     // raced past by two concurrent refund requests.
     refundedAmount: number;
