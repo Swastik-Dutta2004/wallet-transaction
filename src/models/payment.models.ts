@@ -65,7 +65,30 @@ const paymentSchema = new Schema<IPayment>(
             type: Number,
             required: true,
             default: 0,
-            min: 0
+            min: 0,
+
+            // Document-level guard: the total refunded amount must never
+            // exceed the original payment amount.
+            //
+            // IMPORTANT: this only runs during document validation
+            // (save() / validate()). Mongoose does NOT run document
+            // validators for update operators such as
+            // findOneAndUpdate({ $inc: { refundedAmount } }), so this does
+            // NOT protect the refund path. The authoritative protection
+            // there is the atomic $expr + $inc condition in createRefund,
+            // which must stay in place.
+            validate: {
+                validator: function (value: number): boolean {
+                    // During document validation `this` is the document.
+                    // During update validation `this` is a Query and has no
+                    // usable `amount`, so nothing can be checked here.
+                    const document = this as unknown as { amount?: number };
+
+                    return typeof document.amount !== "number"
+                        || value <= document.amount;
+                },
+                message: "refundedAmount cannot be greater than amount"
+            }
         },
 
         status: {
