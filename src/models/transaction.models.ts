@@ -1,10 +1,14 @@
 import mongoose, { Schema, Document, Types } from "mongoose"
 
 export interface ITransaction extends Document {
-    walletId: Types.ObjectId,
+    // Different transaction types use different wallet references:
+    // CREDIT/DEBIT use `walletId`, TRANSFER uses the sender/receiver pair.
+    // They are therefore optional here. The schema below is unchanged and
+    // still applies its existing validation rules.
+    walletId?: Types.ObjectId,
 
-    senderWalletId: Types.ObjectId,
-    receiverWalletId: Types.ObjectId,
+    senderWalletId?: Types.ObjectId,
+    receiverWalletId?: Types.ObjectId,
 
     type: "CREDIT" | "DEBIT" | "TRANSFER",
 
