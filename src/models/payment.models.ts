@@ -5,7 +5,13 @@ export interface IPayment extends Document {
 
     razorpayOrderId: string;
     razorpayPaymentId: string;
-    razorpaySignature: string;
+
+    // The Razorpay Checkout signature (HMAC of "order_id|payment_id").
+    // Only payments verified through the Checkout flow have this. A payment
+    // created from a webhook has no Checkout signature, so this is optional.
+    // It must NEVER hold a webhook signature: those are a different value
+    // (an HMAC of the raw webhook body) and are verified separately.
+    razorpaySignature?: string;
 
     amount: number;
     currency: string;
@@ -17,6 +23,13 @@ export interface IPayment extends Document {
     // the atomic over-refund guard increments, so the cap cannot be
     // raced past by two concurrent refund requests.
     refundedAmount: number;
+
+    // Capacity currently reserved by refunds that are still in flight.
+    // A pending refund holds its amount here but is NOT counted in
+    // refundedAmount, so an unconfirmed refund is never reported as a
+    // completed one. Invariant: refundedAmount + reservedRefundAmount
+    // must never exceed amount.
+    reservedRefundAmount: number;
 
     status: "SUCCESS" | "FAILED";
 
@@ -45,8 +58,7 @@ const paymentSchema = new Schema<IPayment>(
         },
 
         razorpaySignature: {
-            type: String,
-            required: true
+            type: String
         },
 
         amount: {
@@ -88,6 +100,27 @@ const paymentSchema = new Schema<IPayment>(
                         || value <= document.amount;
                 },
                 message: "refundedAmount cannot be greater than amount"
+            }
+        },
+
+        // Reserved refund capacity. Like refundedAmount, this is moved by
+        // atomic $inc operations, so the schema-level rules below are only a
+        // secondary guard. The authoritative cap check is the $expr guard in
+        // the refund controller.
+        reservedRefundAmount: {
+            type: Number,
+            required: true,
+            default: 0,
+            min: 0,
+
+            validate: {
+                validator: function (value: number): boolean {
+                    const document = this as unknown as { amount?: number };
+
+                    return typeof document.amount !== "number"
+                        || value <= document.amount;
+                },
+                message: "reservedRefundAmount cannot be greater than amount"
             }
         },
 
