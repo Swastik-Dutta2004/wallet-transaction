@@ -407,8 +407,14 @@ export const transferMoney = async (
             return
         }
 
-        // Check sender balance
-        if (senderWallet.balance < amountInPaise) {
+        // Check sender balance.
+        // Funds reserved for in-flight refunds are still part of the
+        // balance but may not be spent, so the spendable amount is
+        // balance minus reservedBalance.
+        const availableBalance =
+            senderWallet.balance - (senderWallet.reservedBalance ?? 0)
+
+        if (availableBalance < amountInPaise) {
 
             await session.abortTransaction()
 
