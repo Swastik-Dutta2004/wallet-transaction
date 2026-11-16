@@ -6,6 +6,32 @@ import { AuthRequest } from "../middleware/auth.middleware"
 import ledgerModel from "../models/ledger.models"
 
 
+// Largest single operation we accept, in paise (Rs 10,00,000). Keeping a hard
+// cap stops Math.round(amount * 100) from overflowing to Infinity and keeps
+// balances well inside Number.MAX_SAFE_INTEGER.
+const MAX_TRANSACTION_AMOUNT_IN_PAISE = 100_000_000
+
+// Direct wallet top-ups bypass Razorpay, so any logged-in user could mint
+// money if this were always on. It stays available for local development but
+// is force-disabled when NODE_ENV=production unless explicitly opted in.
+// Real top-ups must go through the Razorpay create-order -> verify (or
+// webhook) flow.
+const directCreditEnabled =
+    process.env.ALLOW_DIRECT_WALLET_CREDIT === "true" ||
+    process.env.NODE_ENV !== "production"
+
+// MongoDB reports a violated unique index with error code 11000. This is the
+// database-level guard that stops two concurrent requests that share an
+// Idempotency-Key from both committing.
+const isDuplicateKeyError = (error: unknown): boolean =>
+    Boolean(
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        (error as { code?: unknown }).code === 11000
+    )
+
+
 export const getWallet = async (
     req: AuthRequest,
     res: Response
@@ -32,10 +58,14 @@ export const getWallet = async (
             return
         }
 
+        const reservedBalance = wallet.reservedBalance ?? 0
+
         res.status(200).json({
             wallet: {
                 id: wallet._id,
                 balance: wallet.balance,
+                reservedBalance,
+                availableBalance: wallet.balance - reservedBalance,
                 currency: wallet.currency,
                 status: wallet.status
             }
@@ -56,11 +86,23 @@ export const addMoney = async (
 
     let session: mongoose.ClientSession | undefined
 
+    // Read these before the try block so the duplicate-key recovery path in
+    // catch can use them.
+    const { amount } = req.body ?? {}
+    const idempotencyKey = req.headers["idempotency-key"]
+    const userId = req.user?.userId
+
     try {
 
-        const { amount } = req.body
-
-        const idempotencyKey = req.headers["idempotency-key"]
+        // Guard the insecure shortcut first: without this, any logged-in
+        // user can credit their own wallet with any amount they like.
+        if (!directCreditEnabled) {
+            res.status(403).json({
+                message:
+                    "Direct wallet credit is disabled. Add money through the Razorpay order and verification flow."
+            })
+            return
+        }
 
         if (!idempotencyKey || typeof idempotencyKey !== "string") {
 
@@ -70,9 +112,6 @@ export const addMoney = async (
 
             return
         }
-
-        // Get user ID from JWT
-        const userId = req.user?.userId
 
         if (!userId) {
 
@@ -96,11 +135,21 @@ export const addMoney = async (
         // Convert rupees to paise
         const amountInPaise = Math.round(amount * 100)
 
-        // Reject amounts that round down to zero paise
-        if (amountInPaise < 1) {
+        // Reject amounts that round down to zero, overflow to Infinity, or
+        // are larger than the allowed per-transaction maximum.
+        if (!Number.isFinite(amountInPaise) || amountInPaise < 1) {
 
             res.status(400).json({
                 message: "Amount must be at least 0.01."
+            })
+
+            return
+        }
+
+        if (amountInPaise > MAX_TRANSACTION_AMOUNT_IN_PAISE) {
+
+            res.status(400).json({
+                message: "Amount exceeds the maximum allowed per transaction."
             })
 
             return
@@ -110,27 +159,9 @@ export const addMoney = async (
 
         session.startTransaction()
 
-        const existingTransaction = await transactionModel.findOne({
-            idempotencyKey
-        }).session(session)
-
-        if (existingTransaction) {
-            await session.abortTransaction()
-
-            res.status(200).json({
-                message: "Request already processed.",
-                transaction: {
-                    id: existingTransaction._id,
-                    type: existingTransaction.type,
-                    amount: existingTransaction.amount,
-                    status: existingTransaction.status
-                }
-            })
-
-            return
-        }
-
-        // Find wallet using logged-in user's ID
+        // Find the caller's wallet first so the idempotency lookup can be
+        // scoped to it. A key that belongs to another user's wallet must
+        // never surface their transaction details.
         const wallet = await walletModel.findOne({
             ownerId: userId
         }).session(session)
@@ -158,22 +189,63 @@ export const addMoney = async (
             return
         }
 
-        // Add money to wallet
+        // Replays return the original result instead of crediting twice.
+        const existingTransaction = await transactionModel.findOne({
+            idempotencyKey,
+            walletId: wallet._id
+        }).session(session)
 
-        const balanceBefore = wallet.balance
+        if (existingTransaction) {
 
-        wallet.balance += amountInPaise
+            await session.abortTransaction()
 
-        const balanceAfter = wallet.balance
+            res.status(200).json({
+                message: "Request already processed.",
+                transaction: {
+                    id: existingTransaction._id,
+                    type: existingTransaction.type,
+                    amount: existingTransaction.amount,
+                    status: existingTransaction.status
+                }
+            })
 
-        await wallet.save({ session })
+            return
+        }
+
+        // Atomic credit. $inc avoids the lost-update race a read-modify-write
+        // (wallet.balance += amount; wallet.save()) would have with a
+        // concurrent credit or transfer.
+        const updatedWallet = await walletModel.findOneAndUpdate(
+            {
+                _id: wallet._id,
+                status: "active"
+            },
+            {
+                $inc: { balance: amountInPaise }
+            },
+            { new: true, session }
+        )
+
+        if (!updatedWallet) {
+
+            await session.abortTransaction()
+
+            res.status(400).json({
+                message: "Wallet is not active."
+            })
+
+            return
+        }
+
+        const balanceAfter = updatedWallet.balance
+        const balanceBefore = balanceAfter - amountInPaise
 
         // Create transaction
         const transaction = new transactionModel({
-            walletId: wallet._id,
+            walletId: updatedWallet._id,
             type: "CREDIT",
             amount: amountInPaise,
-            currency: wallet.currency,
+            currency: updatedWallet.currency,
             idempotencyKey,
             status: "Success",
             description: "Money added to wallet."
@@ -181,13 +253,13 @@ export const addMoney = async (
         await transaction.save({ session })
 
         const ledger = new ledgerModel({
-            walletId: wallet._id,
+            walletId: updatedWallet._id,
             transactionId: transaction._id,
             type: "CREDIT",
             amount: amountInPaise,
             balanceBefore,
             balanceAfter,
-            currency: wallet.currency,
+            currency: updatedWallet.currency,
             description: "Money added to wallet."
         })
 
@@ -199,9 +271,10 @@ export const addMoney = async (
         res.status(200).json({
             message: "Money added successfully.",
             wallet: {
-                id: wallet._id,
-                balance: wallet.balance,
-                currency: wallet.currency
+                id: updatedWallet._id,
+                balance: updatedWallet.balance,
+                reservedBalance: updatedWallet.reservedBalance ?? 0,
+                currency: updatedWallet.currency
             },
             transaction: {
                 id: transaction._id,
@@ -215,6 +288,44 @@ export const addMoney = async (
 
         if (session?.inTransaction()) {
             await session.abortTransaction()
+        }
+
+        // Two identical requests can race past the pre-check above. The
+        // unique index on Transaction.idempotencyKey then rejects one of
+        // them. Return the winning transaction instead of a 500.
+        if (isDuplicateKeyError(error)) {
+
+            const wallet = userId
+                ? await walletModel.findOne({ ownerId: userId })
+                : null
+
+            const existing = wallet
+                ? await transactionModel.findOne({
+                    idempotencyKey: String(idempotencyKey),
+                    walletId: wallet._id
+                })
+                : null
+
+            if (existing) {
+
+                res.status(200).json({
+                    message: "Request already processed.",
+                    transaction: {
+                        id: existing._id,
+                        type: existing.type,
+                        amount: existing.amount,
+                        status: existing.status
+                    }
+                })
+
+                return
+            }
+
+            res.status(409).json({
+                message: "This Idempotency-Key has already been used."
+            })
+
+            return
         }
 
         console.log("Add money error:", error)
@@ -238,14 +349,13 @@ export const transferMoney = async (
 
     let session: mongoose.ClientSession | undefined
 
+    // Read these before the try block so the duplicate-key recovery path in
+    // catch can use them.
+    const { receiverId, amount } = req.body ?? {}
+    const idempotencyKey = req.headers["idempotency-key"]
+    const senderId = req.user?.userId
+
     try {
-
-        const { receiverId, amount } = req.body
-
-        const idempotencyKey = req.headers["idempotency-key"]
-
-        // Get sender ID from JWT
-        const senderId = req.user?.userId
 
         if (!idempotencyKey || typeof idempotencyKey !== "string") {
 
@@ -256,8 +366,6 @@ export const transferMoney = async (
             return
         }
 
-
-        // Validate input
         if (!senderId) {
 
             res.status(401).json({
@@ -298,8 +406,9 @@ export const transferMoney = async (
         // Convert rupees to paise
         const amountInPaise = Math.round(amount * 100)
 
-        // Reject amounts that round down to zero paise
-        if (amountInPaise < 1) {
+        // Reject amounts that round down to zero, overflow to Infinity, or
+        // are larger than the allowed per-transaction maximum.
+        if (!Number.isFinite(amountInPaise) || amountInPaise < 1) {
 
             res.status(400).json({
                 message: "Amount must be at least 0.01."
@@ -308,31 +417,18 @@ export const transferMoney = async (
             return
         }
 
-        session = await mongoose.startSession()
+        if (amountInPaise > MAX_TRANSACTION_AMOUNT_IN_PAISE) {
 
-        session.startTransaction()
-
-        // Idempotency is checked first so replays return the original
-        // result instead of failing on the balance check below
-        const existingTransaction = await transactionModel.findOne({
-            idempotencyKey
-        }).session(session)
-
-        if (existingTransaction) {
-            await session.abortTransaction()
-
-            res.status(200).json({
-                message: "Request already processed.",
-                transaction: {
-                    id: existingTransaction._id,
-                    type: existingTransaction.type,
-                    amount: existingTransaction.amount,
-                    status: existingTransaction.status
-                }
+            res.status(400).json({
+                message: "Amount exceeds the maximum allowed per transaction."
             })
 
             return
         }
+
+        session = await mongoose.startSession()
+
+        session.startTransaction()
 
         // Find sender wallet
         const senderWallet = await walletModel.findOne({
@@ -407,14 +503,58 @@ export const transferMoney = async (
             return
         }
 
-        // Check sender balance.
-        // Funds reserved for in-flight refunds are still part of the
-        // balance but may not be spent, so the spendable amount is
-        // balance minus reservedBalance.
-        const availableBalance =
-            senderWallet.balance - (senderWallet.reservedBalance ?? 0)
+        // Idempotency is scoped to the sender wallet so a key used by another
+        // user can never expose their transfer, and replays return the
+        // original result instead of failing on the balance check below.
+        const existingTransaction = await transactionModel.findOne({
+            idempotencyKey,
+            senderWalletId: senderWallet._id
+        }).session(session)
 
-        if (availableBalance < amountInPaise) {
+        if (existingTransaction) {
+
+            await session.abortTransaction()
+
+            res.status(200).json({
+                message: "Request already processed.",
+                transaction: {
+                    id: existingTransaction._id,
+                    type: existingTransaction.type,
+                    amount: existingTransaction.amount,
+                    status: existingTransaction.status
+                }
+            })
+
+            return
+        }
+
+        // Atomic sender debit. The $expr guard checks the spendable balance
+        // (balance minus reservedBalance) inside the database, so two
+        // concurrent transfers can never both spend the same rupees, and
+        // funds reserved for in-flight refunds stay locked.
+        const debitedSender = await walletModel.findOneAndUpdate(
+            {
+                _id: senderWallet._id,
+                status: "active",
+                $expr: {
+                    $gte: [
+                        {
+                            $subtract: [
+                                "$balance",
+                                { $ifNull: ["$reservedBalance", 0] }
+                            ]
+                        },
+                        amountInPaise
+                    ]
+                }
+            },
+            {
+                $inc: { balance: -amountInPaise }
+            },
+            { new: true, session }
+        )
+
+        if (!debitedSender) {
 
             await session.abortTransaction()
 
@@ -425,26 +565,37 @@ export const transferMoney = async (
             return
         }
 
-        const senderBalanceBefore = senderWallet.balance
-        const receiverBalanceBefore = receiverWallet.balance
+        // Atomic receiver credit. If it fails, throw so the whole transaction
+        // (including the sender debit) is rolled back.
+        const creditedReceiver = await walletModel.findOneAndUpdate(
+            {
+                _id: receiverWallet._id,
+                status: "active"
+            },
+            {
+                $inc: { balance: amountInPaise }
+            },
+            { new: true, session }
+        )
 
-        senderWallet.balance -= amountInPaise
-        receiverWallet.balance += amountInPaise
+        if (!creditedReceiver) {
+            throw new Error(
+                "Receiver wallet became unavailable during transfer."
+            )
+        }
 
-        const senderBalanceAfter = senderWallet.balance
-        const receiverBalanceAfter = receiverWallet.balance
-
-        // Save both wallets
-        await senderWallet.save({ session })
-        await receiverWallet.save({ session })
+        const senderBalanceBefore = debitedSender.balance + amountInPaise
+        const senderBalanceAfter = debitedSender.balance
+        const receiverBalanceBefore = creditedReceiver.balance - amountInPaise
+        const receiverBalanceAfter = creditedReceiver.balance
 
         // Create transfer transaction
         const transaction = new transactionModel({
-            senderWalletId: senderWallet._id,
-            receiverWalletId: receiverWallet._id,
+            senderWalletId: debitedSender._id,
+            receiverWalletId: creditedReceiver._id,
             type: "TRANSFER",
             amount: amountInPaise,
-            currency: senderWallet.currency,
+            currency: debitedSender.currency,
             idempotencyKey,
             status: "Success",
             description: "Wallet-to-wallet transfer"
@@ -454,13 +605,13 @@ export const transferMoney = async (
 
 
         const senderLedger = new ledgerModel({
-            walletId: senderWallet._id,
+            walletId: debitedSender._id,
             transactionId: transaction._id,
             type: "DEBIT",
             amount: amountInPaise,
             balanceBefore: senderBalanceBefore,
             balanceAfter: senderBalanceAfter,
-            currency: senderWallet.currency,
+            currency: debitedSender.currency,
             description: "Wallet-to-wallet transfer"
         })
 
@@ -468,13 +619,13 @@ export const transferMoney = async (
 
 
         const receiverLedger = new ledgerModel({
-            walletId: receiverWallet._id,
+            walletId: creditedReceiver._id,
             transactionId: transaction._id,
             type: "CREDIT",
             amount: amountInPaise,
             balanceBefore: receiverBalanceBefore,
             balanceAfter: receiverBalanceAfter,
-            currency: receiverWallet.currency,
+            currency: creditedReceiver.currency,
             description: "Wallet-to-wallet transfer"
         })
 
@@ -492,12 +643,12 @@ export const transferMoney = async (
                 status: transaction.status
             },
             senderWallet: {
-                id: senderWallet._id,
-                balance: senderWallet.balance
+                id: debitedSender._id,
+                balance: debitedSender.balance
             },
             receiverWallet: {
-                id: receiverWallet._id,
-                balance: receiverWallet.balance
+                id: creditedReceiver._id,
+                balance: creditedReceiver.balance
             }
         })
 
@@ -505,6 +656,44 @@ export const transferMoney = async (
 
         if (session?.inTransaction()) {
             await session.abortTransaction()
+        }
+
+        // A concurrent duplicate can lose the race on the unique
+        // Transaction.idempotencyKey index. Return the original transfer
+        // instead of a 500 so retrying a request is always safe.
+        if (isDuplicateKeyError(error)) {
+
+            const senderWallet = senderId
+                ? await walletModel.findOne({ ownerId: senderId })
+                : null
+
+            const existing = senderWallet
+                ? await transactionModel.findOne({
+                    idempotencyKey: String(idempotencyKey),
+                    senderWalletId: senderWallet._id
+                })
+                : null
+
+            if (existing) {
+
+                res.status(200).json({
+                    message: "Request already processed.",
+                    transaction: {
+                        id: existing._id,
+                        type: existing.type,
+                        amount: existing.amount,
+                        status: existing.status
+                    }
+                })
+
+                return
+            }
+
+            res.status(409).json({
+                message: "This Idempotency-Key has already been used."
+            })
+
+            return
         }
 
         console.log("Transfer error:", error)
@@ -548,6 +737,15 @@ export const getTransactions = async (
             return
         }
 
+        // Cap the page size so an unbounded history query cannot pull the
+        // whole collection into memory.
+        const rawLimit = Number(req.query.limit)
+
+        const limit =
+            Number.isFinite(rawLimit) && rawLimit > 0
+                ? Math.min(Math.floor(rawLimit), 100)
+                : 50
+
         // Find transactions related to this wallet
         const transactions = await transactionModel
             .find({
@@ -558,9 +756,11 @@ export const getTransactions = async (
                 ]
             })
             .sort({ createdAt: -1 })
+            .limit(limit)
 
         res.status(200).json({
             message: "Transactions fetched successfully.",
+            limit,
             transactions
         })
 
