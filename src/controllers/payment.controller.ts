@@ -61,7 +61,7 @@ export const createOrder = async (
 
         if (amountInPaise < 1) {
             res.status(400).json({
-                message: "Amount must be at least 0.01."
+                message: "Amount must be at least 1Rs."
             });
             return;
         }
