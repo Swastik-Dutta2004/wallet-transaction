@@ -30,16 +30,19 @@ const transcationSchema = new Schema<ITransaction>(
         walletId: {
             type: Schema.Types.ObjectId,
             ref: "Wallet",
+            index: true
         },
 
         senderWalletId: {
             type: Schema.Types.ObjectId,
-            ref: "Wallet"
+            ref: "Wallet",
+            index: true
         },
 
         receiverWalletId: {
             type: Schema.Types.ObjectId,
-            ref: "Wallet"
+            ref: "Wallet",
+            index: true
         },
 
         type: {
