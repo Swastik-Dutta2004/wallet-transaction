@@ -37,9 +37,36 @@ app.use((req: Request, res: Response) => {
 // so Express recognises it as an error handler.
 app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
 
-    // body-parser wraps malformed JSON in a SyntaxError. Answer 400 instead
-    // of letting it look like an internal server error.
-    if (error instanceof SyntaxError) {
+    // body-parser tags its own failures with a `type` field. Using it is
+    // more reliable than a bare `instanceof SyntaxError`, which would also
+    // catch unrelated programming errors and mislabel them as a 400.
+    const bodyParserError = error as
+        | { type?: string; status?: number }
+        | null
+        | undefined
+
+    if (bodyParserError?.type === "entity.parse.failed") {
+        res.status(400).json({
+            message: "Invalid JSON body."
+        })
+        return
+    }
+
+    // Payloads above the configured json body limit.
+    if (bodyParserError?.type === "entity.too.large") {
+        res.status(413).json({
+            message: "Request body is too large."
+        })
+        return
+    }
+
+    // Older/other body-parser versions surface malformed JSON as a
+    // SyntaxError carrying the raw `body` property. Keep this as a fallback.
+    if (
+        error instanceof SyntaxError &&
+        bodyParserError?.status === 400 &&
+        "body" in error
+    ) {
         res.status(400).json({
             message: "Invalid JSON body."
         })
