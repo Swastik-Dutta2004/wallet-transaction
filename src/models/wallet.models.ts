@@ -29,7 +29,20 @@ const walletSchema = new Schema<IWallet>({
         type: Number,
         required: true,
         default: 0,
-        min: 0
+        min: 0,
+
+        // Reserved funds are still part of `balance` but may not be spent,
+        // so the reserved amount can never exceed the total. Enforced on
+        // `balance` because it is always present, unlike reservedBalance on
+        // legacy documents.
+        validate: {
+            validator: function (value: number): boolean {
+                const wallet = this as unknown as { reservedBalance?: number }
+
+                return (wallet.reservedBalance ?? 0) <= value
+            },
+            message: "reservedBalance cannot exceed balance"
+        }
     },
 
     reservedBalance: {
