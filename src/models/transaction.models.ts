@@ -3,8 +3,8 @@ import mongoose, { Schema, Document, Types } from "mongoose"
 export interface ITransaction extends Document {
     // Different transaction types use different wallet references:
     // CREDIT/DEBIT use `walletId`, TRANSFER uses the sender/receiver pair.
-    // They are therefore optional here. The schema below is unchanged and
-    // still applies its existing validation rules.
+    // They stay optional at the field level because the required combination
+    // depends on `type`, and is enforced by the `type` validator below.
     walletId?: Types.ObjectId,
 
     senderWalletId?: Types.ObjectId,
@@ -18,6 +18,11 @@ export interface ITransaction extends Document {
     status: "Success" | "Pending" | "Failed",
 
     idempotencyKey?: string;
+
+    // SHA-256 of the canonical request parameters. When a client retries
+    // with the same Idempotency-Key we can prove the parameters are
+    // identical instead of blindly replaying (or silently double crediting).
+    requestFingerprint?: string;
 
     description?: string,
 
@@ -48,14 +53,55 @@ const transcationSchema = new Schema<ITransaction>(
         type: {
             type: String,
             enum: ["CREDIT", "DEBIT", "TRANSFER"],
-            required: true
+            required: true,
+
+            // Cross-field validation lives on `type` because it is always
+            // present. A validator on walletId/senderWalletId would be
+            // skipped whenever that field is undefined.
+            validate: {
+                validator: function (value: string): boolean {
+                    const transaction = this as unknown as {
+                        walletId?: unknown;
+                        senderWalletId?: unknown;
+                        receiverWalletId?: unknown;
+                    };
+
+                    const hasWalletId = transaction.walletId != null;
+                    const hasSender = transaction.senderWalletId != null;
+                    const hasReceiver = transaction.receiverWalletId != null;
+
+                    if (value === "CREDIT" || value === "DEBIT") {
+                        return hasWalletId && !hasSender && !hasReceiver;
+                    }
+
+                    if (value === "TRANSFER") {
+                        return (
+                            !hasWalletId &&
+                            hasSender &&
+                            hasReceiver &&
+                            String(transaction.senderWalletId) !==
+                            String(transaction.receiverWalletId)
+                        );
+                    }
+
+                    return false;
+                },
+                message:
+                    "CREDIT/DEBIT require only walletId; TRANSFER requires distinct senderWalletId and receiverWalletId."
+            }
         },
 
         amount: {
             type: Number,
             required: true,
-            min: 1
+            min: 1,
 
+            // Money is stored as integer paise. Reject 1.5, NaN, Infinity,
+            // and anything else that is not a whole positive number.
+            validate: {
+                validator: (value: number): boolean => Number.isInteger(value),
+                message: "amount must be a positive integer number of paise"
+            }
         },
 
         currency: {
@@ -74,6 +120,11 @@ const transcationSchema = new Schema<ITransaction>(
             type: String,
             unique: true,
             sparse: true
+        },
+
+        // Internal only: never selected into API responses.
+        requestFingerprint: {
+            type: String
         },
 
         description: {
