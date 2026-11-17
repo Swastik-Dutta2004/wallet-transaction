@@ -1,7 +1,8 @@
-import mongoose from "mongoose";
-import { Request, Response } from "express"
+import mongoose, { QueryFilter } from "mongoose";
+import crypto from "crypto";
+import { Response } from "express"
 import walletModel from "../models/wallet.models"
-import transactionModel from "../models/transaction.models";
+import transactionModel, { ITransaction } from "../models/transaction.models";
 import { AuthRequest } from "../middleware/auth.middleware"
 import ledgerModel from "../models/ledger.models"
 
@@ -30,6 +31,186 @@ const isDuplicateKeyError = (error: unknown): boolean =>
         "code" in error &&
         (error as { code?: unknown }).code === 11000
     )
+
+
+// Expected business failures are thrown from inside a transaction so the
+// transaction aborts cleanly, then mapped back to an HTTP status here.
+class WalletRequestError extends Error {
+    readonly status: number
+
+    constructor(status: number, message: string) {
+        super(message)
+        this.name = "WalletRequestError"
+        this.status = status
+    }
+}
+
+
+// Run `work` inside a single MongoDB transaction and commit only when it
+// resolves. `withTransaction` also retries on transient failures (write
+// conflicts) and aborts automatically if `work` throws. A replica set is
+// required for multi-document transactions.
+const runInTransaction = async <T>(
+    work: (session: mongoose.ClientSession) => Promise<T>
+): Promise<T> => {
+
+    const session = await mongoose.startSession()
+
+    try {
+        let outcome: { value: T } | undefined
+
+        await session.withTransaction(async () => {
+            outcome = { value: await work(session) }
+        })
+
+        if (!outcome) {
+            throw new Error("Transaction finished without a result.")
+        }
+
+        return outcome.value
+    } finally {
+        await session.endSession()
+    }
+}
+
+
+// A request fingerprint proves that a retry carrying the same Idempotency-Key
+// also carries identical parameters. Without it a client could reuse a key
+// with a different amount and either double-credit or silently get the wrong
+// result. Only the hash is stored, never the raw request.
+const hashRequest = (parts: ReadonlyArray<string | number>): string =>
+    crypto
+        .createHash("sha256")
+        .update(JSON.stringify(parts))
+        .digest("hex")
+
+const walletFingerprint = (
+    type: "CREDIT" | "DEBIT",
+    walletId: unknown,
+    amountInPaise: number,
+    currency: string
+): string =>
+    hashRequest([type, String(walletId), amountInPaise, currency])
+
+const transferFingerprint = (
+    senderWalletId: unknown,
+    receiverWalletId: unknown,
+    amountInPaise: number,
+    currency: string
+): string =>
+    hashRequest([
+        "TRANSFER",
+        String(senderWalletId),
+        String(receiverWalletId),
+        amountInPaise,
+        currency
+    ])
+
+// Rows written before requestFingerprint existed have to be compared using a
+// value derived from their stored fields, otherwise a retry of an old request
+// would look like a parameter mismatch.
+const fingerprintForTransaction = (transaction: {
+    type?: string;
+    walletId?: unknown;
+    senderWalletId?: unknown;
+    receiverWalletId?: unknown;
+    amount?: number;
+    currency?: string;
+}): string => {
+    const amount = transaction.amount ?? 0
+    const currency = transaction.currency ?? "INR"
+
+    if (transaction.type === "TRANSFER") {
+        return transferFingerprint(
+            transaction.senderWalletId,
+            transaction.receiverWalletId,
+            amount,
+            currency
+        )
+    }
+
+    return walletFingerprint(
+        transaction.type === "DEBIT" ? "DEBIT" : "CREDIT",
+        transaction.walletId,
+        amount,
+        currency
+    )
+}
+
+
+type IdempotencyResolution =
+    | { kind: "none" }
+    | { kind: "replay"; transaction: ITransaction }
+
+
+// Idempotency keys are globally unique (unique index on
+// Transaction.idempotencyKey), so the lookup is global as well. A different
+// wallet reusing the key is rejected rather than allowed to observe someone
+// else's transaction.
+const resolveIdempotency = async (
+    idempotencyKey: string,
+    expectedFingerprint: string,
+    session: mongoose.ClientSession
+): Promise<IdempotencyResolution> => {
+
+    const existing = await transactionModel
+        .findOne({ idempotencyKey })
+        .session(session)
+
+    if (!existing) {
+        return { kind: "none" }
+    }
+
+    const existingFingerprint =
+        existing.requestFingerprint ?? fingerprintForTransaction(existing)
+
+    if (existingFingerprint !== expectedFingerprint) {
+        throw new WalletRequestError(
+            409,
+            "Idempotency-Key has already been used with different request parameters."
+        )
+    }
+
+    return { kind: "replay", transaction: existing }
+}
+
+
+const replayResponse = (transaction: ITransaction) => ({
+    message: "Request already processed.",
+    transaction: {
+        id: transaction._id,
+        type: transaction.type,
+        amount: transaction.amount,
+        status: transaction.status
+    }
+})
+
+
+// Two identical requests can still race past resolveIdempotency. The unique
+// index rejects one of them, and this rebuilds the replay (or a conflict) for
+// whichever request lost.
+const recoverFromDuplicateKey = async (
+    idempotencyKey: string,
+    expectedFingerprint: string | undefined
+): Promise<
+    { kind: "replay"; transaction: ITransaction } | { kind: "conflict" }
+> => {
+
+    const existing = await transactionModel.findOne({ idempotencyKey })
+
+    if (!existing || !expectedFingerprint) {
+        return { kind: "conflict" }
+    }
+
+    const existingFingerprint =
+        existing.requestFingerprint ?? fingerprintForTransaction(existing)
+
+    if (existingFingerprint !== expectedFingerprint) {
+        return { kind: "conflict" }
+    }
+
+    return { kind: "replay", transaction: existing }
+}
 
 
 export const getWallet = async (
@@ -84,13 +265,15 @@ export const addMoney = async (
     res: Response
 ): Promise<void> => {
 
-    let session: mongoose.ClientSession | undefined
-
     // Read these before the try block so the duplicate-key recovery path in
     // catch can use them.
     const { amount } = req.body ?? {}
     const idempotencyKey = req.headers["idempotency-key"]
     const userId = req.user?.userId
+
+    // Assigned inside the transaction; needed by duplicate-key recovery once
+    // the transaction has been aborted.
+    let expectedFingerprint: string | undefined
 
     try {
 
@@ -155,176 +338,145 @@ export const addMoney = async (
             return
         }
 
-        session = await mongoose.startSession()
+        const outcome = await runInTransaction(async (session) => {
 
-        session.startTransaction()
+            const wallet = await walletModel.findOne({
+                ownerId: userId
+            }).session(session)
 
-        // Find the caller's wallet first so the idempotency lookup can be
-        // scoped to it. A key that belongs to another user's wallet must
-        // never surface their transaction details.
-        const wallet = await walletModel.findOne({
-            ownerId: userId
-        }).session(session)
+            if (!wallet) {
+                throw new WalletRequestError(404, "Wallet not found.")
+            }
 
-        if (!wallet) {
+            if (wallet.status !== "active") {
+                throw new WalletRequestError(400, "Wallet is not active.")
+            }
 
-            await session.abortTransaction()
+            const fingerprint = walletFingerprint(
+                "CREDIT",
+                wallet._id,
+                amountInPaise,
+                wallet.currency
+            )
+            expectedFingerprint = fingerprint
 
-            res.status(404).json({
-                message: "Wallet not found."
-            })
+            // Replays return the original result instead of crediting twice.
+            const idempotency = await resolveIdempotency(
+                idempotencyKey,
+                fingerprint,
+                session
+            )
 
-            return
-        }
-
-        // Check wallet status
-        if (wallet.status !== "active") {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Wallet is not active."
-            })
-
-            return
-        }
-
-        // Replays return the original result instead of crediting twice.
-        const existingTransaction = await transactionModel.findOne({
-            idempotencyKey,
-            walletId: wallet._id
-        }).session(session)
-
-        if (existingTransaction) {
-
-            await session.abortTransaction()
-
-            res.status(200).json({
-                message: "Request already processed.",
-                transaction: {
-                    id: existingTransaction._id,
-                    type: existingTransaction.type,
-                    amount: existingTransaction.amount,
-                    status: existingTransaction.status
+            if (idempotency.kind === "replay") {
+                return {
+                    kind: "replay" as const,
+                    transaction: idempotency.transaction
                 }
+            }
+
+            // Atomic credit. $inc avoids the lost-update race a
+            // read-modify-write (wallet.balance += amount; wallet.save())
+            // would have with a concurrent credit or transfer.
+            const updatedWallet = await walletModel.findOneAndUpdate(
+                {
+                    _id: wallet._id,
+                    status: "active"
+                },
+                {
+                    $inc: { balance: amountInPaise }
+                },
+                { new: true, session }
+            )
+
+            if (!updatedWallet) {
+                throw new WalletRequestError(400, "Wallet is not active.")
+            }
+
+            const balanceAfter = updatedWallet.balance
+            const balanceBefore = balanceAfter - amountInPaise
+
+            // Create transaction
+            const transaction = new transactionModel({
+                walletId: updatedWallet._id,
+                type: "CREDIT",
+                amount: amountInPaise,
+                currency: updatedWallet.currency,
+                idempotencyKey,
+                requestFingerprint: fingerprint,
+                status: "Success",
+                description: "Money added to wallet."
+            })
+            await transaction.save({ session })
+
+            const ledger = new ledgerModel({
+                walletId: updatedWallet._id,
+                transactionId: transaction._id,
+                type: "CREDIT",
+                amount: amountInPaise,
+                balanceBefore,
+                balanceAfter,
+                currency: updatedWallet.currency,
+                description: "Money added to wallet."
             })
 
-            return
-        }
+            await ledger.save({ session })
 
-        // Atomic credit. $inc avoids the lost-update race a read-modify-write
-        // (wallet.balance += amount; wallet.save()) would have with a
-        // concurrent credit or transfer.
-        const updatedWallet = await walletModel.findOneAndUpdate(
-            {
-                _id: wallet._id,
-                status: "active"
-            },
-            {
-                $inc: { balance: amountInPaise }
-            },
-            { new: true, session }
-        )
-
-        if (!updatedWallet) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Wallet is not active."
-            })
-
-            return
-        }
-
-        const balanceAfter = updatedWallet.balance
-        const balanceBefore = balanceAfter - amountInPaise
-
-        // Create transaction
-        const transaction = new transactionModel({
-            walletId: updatedWallet._id,
-            type: "CREDIT",
-            amount: amountInPaise,
-            currency: updatedWallet.currency,
-            idempotencyKey,
-            status: "Success",
-            description: "Money added to wallet."
-        })
-        await transaction.save({ session })
-
-        const ledger = new ledgerModel({
-            walletId: updatedWallet._id,
-            transactionId: transaction._id,
-            type: "CREDIT",
-            amount: amountInPaise,
-            balanceBefore,
-            balanceAfter,
-            currency: updatedWallet.currency,
-            description: "Money added to wallet."
+            return {
+                kind: "created" as const,
+                wallet: updatedWallet,
+                transaction
+            }
         })
 
-        await ledger.save({ session })
-
-        // Commit database transaction
-        await session.commitTransaction()
+        if (outcome.kind === "replay") {
+            res.status(200).json(replayResponse(outcome.transaction))
+            return
+        }
 
         res.status(200).json({
             message: "Money added successfully.",
             wallet: {
-                id: updatedWallet._id,
-                balance: updatedWallet.balance,
-                reservedBalance: updatedWallet.reservedBalance ?? 0,
-                currency: updatedWallet.currency
+                id: outcome.wallet._id,
+                balance: outcome.wallet.balance,
+                reservedBalance: outcome.wallet.reservedBalance ?? 0,
+                currency: outcome.wallet.currency
             },
             transaction: {
-                id: transaction._id,
-                type: transaction.type,
-                amount: transaction.amount,
-                status: transaction.status
+                id: outcome.transaction._id,
+                type: outcome.transaction.type,
+                amount: outcome.transaction.amount,
+                status: outcome.transaction.status
             }
         })
 
     } catch (error) {
 
-        if (session?.inTransaction()) {
-            await session.abortTransaction()
+        if (error instanceof WalletRequestError) {
+            res.status(error.status).json({
+                message: error.message
+            })
+            return
         }
 
-        // Two identical requests can race past the pre-check above. The
-        // unique index on Transaction.idempotencyKey then rejects one of
-        // them. Return the winning transaction instead of a 500.
+        // The unique index on Transaction.idempotencyKey rejected a
+        // concurrent duplicate. Return the winning transaction when the
+        // parameters match, otherwise report the key conflict.
         if (isDuplicateKeyError(error)) {
 
-            const wallet = userId
-                ? await walletModel.findOne({ ownerId: userId })
-                : null
+            const recovery = await recoverFromDuplicateKey(
+                String(idempotencyKey),
+                expectedFingerprint
+            )
 
-            const existing = wallet
-                ? await transactionModel.findOne({
-                    idempotencyKey: String(idempotencyKey),
-                    walletId: wallet._id
-                })
-                : null
-
-            if (existing) {
-
-                res.status(200).json({
-                    message: "Request already processed.",
-                    transaction: {
-                        id: existing._id,
-                        type: existing.type,
-                        amount: existing.amount,
-                        status: existing.status
-                    }
-                })
-
+            if (recovery.kind === "replay") {
+                res.status(200).json(replayResponse(recovery.transaction))
                 return
             }
 
             res.status(409).json({
-                message: "This Idempotency-Key has already been used."
+                message:
+                    "Idempotency-Key has already been used with different request parameters."
             })
-
             return
         }
 
@@ -333,11 +485,6 @@ export const addMoney = async (
         res.status(500).json({
             message: "Internal server error."
         })
-
-    } finally {
-
-        await session?.endSession()
-
     }
 }
 
@@ -347,13 +494,15 @@ export const transferMoney = async (
     res: Response
 ): Promise<void> => {
 
-    let session: mongoose.ClientSession | undefined
-
     // Read these before the try block so the duplicate-key recovery path in
     // catch can use them.
     const { receiverId, amount } = req.body ?? {}
     const idempotencyKey = req.headers["idempotency-key"]
     const senderId = req.user?.userId
+
+    // Assigned inside the transaction; needed by duplicate-key recovery once
+    // the transaction has been aborted.
+    let expectedFingerprint: string | undefined
 
     try {
 
@@ -426,236 +575,210 @@ export const transferMoney = async (
             return
         }
 
-        session = await mongoose.startSession()
+        const outcome = await runInTransaction(async (session) => {
 
-        session.startTransaction()
+            // Find sender wallet
+            const senderWallet = await walletModel.findOne({
+                ownerId: senderId
+            }).session(session)
 
-        // Find sender wallet
-        const senderWallet = await walletModel.findOne({
-            ownerId: senderId
-        }).session(session)
+            if (!senderWallet) {
+                throw new WalletRequestError(404, "Sender wallet not found.")
+            }
 
-        if (!senderWallet) {
+            // Find receiver wallet
+            const receiverWallet = await walletModel.findOne({
+                ownerId: receiverId
+            }).session(session)
 
-            await session.abortTransaction()
+            if (!receiverWallet) {
+                throw new WalletRequestError(404, "Receiver wallet not found.")
+            }
 
-            res.status(404).json({
-                message: "Sender wallet not found."
-            })
+            // Sender and receiver cannot be the same.
+            // Compared as ObjectIds so casing/format differences on the
+            // receiver id cannot bypass the check.
+            if (String(senderWallet._id) === String(receiverWallet._id)) {
+                throw new WalletRequestError(
+                    400,
+                    "Sender and receiver cannot be the same."
+                )
+            }
 
-            return
-        }
+            // Check wallet status
+            if (
+                senderWallet.status !== "active" ||
+                receiverWallet.status !== "active"
+            ) {
+                throw new WalletRequestError(400, "Both wallets must be active.")
+            }
 
-        // Find receiver wallet
-        const receiverWallet = await walletModel.findOne({
-            ownerId: receiverId
-        }).session(session)
+            // Both sides must settle in the same currency
+            if (senderWallet.currency !== receiverWallet.currency) {
+                throw new WalletRequestError(
+                    400,
+                    "Both wallets must use the same currency."
+                )
+            }
 
-        if (!receiverWallet) {
-
-            await session.abortTransaction()
-
-            res.status(404).json({
-                message: "Receiver wallet not found."
-            })
-
-            return
-        }
-
-        // Sender and receiver cannot be the same.
-        // Compared as ObjectIds so casing/format differences on the
-        // receiver id cannot bypass the check.
-        if (String(senderWallet._id) === String(receiverWallet._id)) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Sender and receiver cannot be the same."
-            })
-
-            return
-        }
-
-        // Check wallet status
-        if (
-            senderWallet.status !== "active" ||
-            receiverWallet.status !== "active"
-        ) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Both wallets must be active."
-            })
-
-            return
-        }
-
-        // Both sides must settle in the same currency
-        if (senderWallet.currency !== receiverWallet.currency) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Both wallets must use the same currency."
-            })
-
-            return
-        }
-
-        // Idempotency is scoped to the sender wallet so a key used by another
-        // user can never expose their transfer, and replays return the
-        // original result instead of failing on the balance check below.
-        const existingTransaction = await transactionModel.findOne({
-            idempotencyKey,
-            senderWalletId: senderWallet._id
-        }).session(session)
-
-        if (existingTransaction) {
-
-            await session.abortTransaction()
-
-            res.status(200).json({
-                message: "Request already processed.",
-                transaction: {
-                    id: existingTransaction._id,
-                    type: existingTransaction.type,
-                    amount: existingTransaction.amount,
-                    status: existingTransaction.status
-                }
-            })
-
-            return
-        }
-
-        // Atomic sender debit. The $expr guard checks the spendable balance
-        // (balance minus reservedBalance) inside the database, so two
-        // concurrent transfers can never both spend the same rupees, and
-        // funds reserved for in-flight refunds stay locked.
-        const debitedSender = await walletModel.findOneAndUpdate(
-            {
-                _id: senderWallet._id,
-                status: "active",
-                $expr: {
-                    $gte: [
-                        {
-                            $subtract: [
-                                "$balance",
-                                { $ifNull: ["$reservedBalance", 0] }
-                            ]
-                        },
-                        amountInPaise
-                    ]
-                }
-            },
-            {
-                $inc: { balance: -amountInPaise }
-            },
-            { new: true, session }
-        )
-
-        if (!debitedSender) {
-
-            await session.abortTransaction()
-
-            res.status(400).json({
-                message: "Insufficient wallet balance."
-            })
-
-            return
-        }
-
-        // Atomic receiver credit. If it fails, throw so the whole transaction
-        // (including the sender debit) is rolled back.
-        const creditedReceiver = await walletModel.findOneAndUpdate(
-            {
-                _id: receiverWallet._id,
-                status: "active"
-            },
-            {
-                $inc: { balance: amountInPaise }
-            },
-            { new: true, session }
-        )
-
-        if (!creditedReceiver) {
-            throw new Error(
-                "Receiver wallet became unavailable during transfer."
+            const fingerprint = transferFingerprint(
+                senderWallet._id,
+                receiverWallet._id,
+                amountInPaise,
+                senderWallet.currency
             )
+            expectedFingerprint = fingerprint
+
+            // Replays return the original result instead of failing on the
+            // balance check below.
+            const idempotency = await resolveIdempotency(
+                idempotencyKey,
+                fingerprint,
+                session
+            )
+
+            if (idempotency.kind === "replay") {
+                return {
+                    kind: "replay" as const,
+                    transaction: idempotency.transaction
+                }
+            }
+
+            // Atomic sender debit. The $expr guard checks the spendable
+            // balance (balance minus reservedBalance) inside the database, so
+            // two concurrent transfers can never both spend the same rupees,
+            // and funds reserved for in-flight refunds stay locked.
+            const debitedSender = await walletModel.findOneAndUpdate(
+                {
+                    _id: senderWallet._id,
+                    status: "active",
+                    $expr: {
+                        $gte: [
+                            {
+                                $subtract: [
+                                    "$balance",
+                                    { $ifNull: ["$reservedBalance", 0] }
+                                ]
+                            },
+                            amountInPaise
+                        ]
+                    }
+                },
+                {
+                    $inc: { balance: -amountInPaise }
+                },
+                { new: true, session }
+            )
+
+            if (!debitedSender) {
+                throw new WalletRequestError(400, "Insufficient wallet balance.")
+            }
+
+            // Atomic receiver credit. If it fails, throw so the whole
+            // transaction (including the sender debit) is rolled back.
+            const creditedReceiver = await walletModel.findOneAndUpdate(
+                {
+                    _id: receiverWallet._id,
+                    status: "active"
+                },
+                {
+                    $inc: { balance: amountInPaise }
+                },
+                { new: true, session }
+            )
+
+            if (!creditedReceiver) {
+                throw new Error(
+                    "Receiver wallet became unavailable during transfer."
+                )
+            }
+
+            const senderBalanceBefore = debitedSender.balance + amountInPaise
+            const senderBalanceAfter = debitedSender.balance
+            const receiverBalanceBefore = creditedReceiver.balance - amountInPaise
+            const receiverBalanceAfter = creditedReceiver.balance
+
+            // Create transfer transaction
+            const transaction = new transactionModel({
+                senderWalletId: debitedSender._id,
+                receiverWalletId: creditedReceiver._id,
+                type: "TRANSFER",
+                amount: amountInPaise,
+                currency: debitedSender.currency,
+                idempotencyKey,
+                requestFingerprint: fingerprint,
+                status: "Success",
+                description: "Wallet-to-wallet transfer"
+            })
+
+            await transaction.save({ session })
+
+
+            const senderLedger = new ledgerModel({
+                walletId: debitedSender._id,
+                transactionId: transaction._id,
+                type: "DEBIT",
+                amount: amountInPaise,
+                balanceBefore: senderBalanceBefore,
+                balanceAfter: senderBalanceAfter,
+                currency: debitedSender.currency,
+                description: "Wallet-to-wallet transfer"
+            })
+
+            await senderLedger.save({ session })
+
+
+            const receiverLedger = new ledgerModel({
+                walletId: creditedReceiver._id,
+                transactionId: transaction._id,
+                type: "CREDIT",
+                amount: amountInPaise,
+                balanceBefore: receiverBalanceBefore,
+                balanceAfter: receiverBalanceAfter,
+                currency: creditedReceiver.currency,
+                description: "Wallet-to-wallet transfer"
+            })
+
+            await receiverLedger.save({ session })
+
+            return {
+                kind: "created" as const,
+                transaction,
+                senderWallet: debitedSender,
+                receiverWallet: creditedReceiver
+            }
+        })
+
+        if (outcome.kind === "replay") {
+            res.status(200).json(replayResponse(outcome.transaction))
+            return
         }
-
-        const senderBalanceBefore = debitedSender.balance + amountInPaise
-        const senderBalanceAfter = debitedSender.balance
-        const receiverBalanceBefore = creditedReceiver.balance - amountInPaise
-        const receiverBalanceAfter = creditedReceiver.balance
-
-        // Create transfer transaction
-        const transaction = new transactionModel({
-            senderWalletId: debitedSender._id,
-            receiverWalletId: creditedReceiver._id,
-            type: "TRANSFER",
-            amount: amountInPaise,
-            currency: debitedSender.currency,
-            idempotencyKey,
-            status: "Success",
-            description: "Wallet-to-wallet transfer"
-        })
-
-        await transaction.save({ session })
-
-
-        const senderLedger = new ledgerModel({
-            walletId: debitedSender._id,
-            transactionId: transaction._id,
-            type: "DEBIT",
-            amount: amountInPaise,
-            balanceBefore: senderBalanceBefore,
-            balanceAfter: senderBalanceAfter,
-            currency: debitedSender.currency,
-            description: "Wallet-to-wallet transfer"
-        })
-
-        await senderLedger.save({ session })
-
-
-        const receiverLedger = new ledgerModel({
-            walletId: creditedReceiver._id,
-            transactionId: transaction._id,
-            type: "CREDIT",
-            amount: amountInPaise,
-            balanceBefore: receiverBalanceBefore,
-            balanceAfter: receiverBalanceAfter,
-            currency: creditedReceiver.currency,
-            description: "Wallet-to-wallet transfer"
-        })
-
-        await receiverLedger.save({ session })
-
-        // Commit transaction
-        await session.commitTransaction()
 
         res.status(200).json({
             message: "Money transferred successfully.",
             transfer: {
-                transactionId: transaction._id,
-                amount: transaction.amount,
-                currency: transaction.currency,
-                status: transaction.status
+                transactionId: outcome.transaction._id,
+                amount: outcome.transaction.amount,
+                currency: outcome.transaction.currency,
+                status: outcome.transaction.status
             },
             senderWallet: {
-                id: debitedSender._id,
-                balance: debitedSender.balance
+                id: outcome.senderWallet._id,
+                balance: outcome.senderWallet.balance
             },
             receiverWallet: {
-                id: creditedReceiver._id,
-                balance: creditedReceiver.balance
+                id: outcome.receiverWallet._id,
+                balance: outcome.receiverWallet.balance
             }
         })
 
     } catch (error) {
 
-        if (session?.inTransaction()) {
-            await session.abortTransaction()
+        if (error instanceof WalletRequestError) {
+            res.status(error.status).json({
+                message: error.message
+            })
+            return
         }
 
         // A concurrent duplicate can lose the race on the unique
@@ -663,36 +786,20 @@ export const transferMoney = async (
         // instead of a 500 so retrying a request is always safe.
         if (isDuplicateKeyError(error)) {
 
-            const senderWallet = senderId
-                ? await walletModel.findOne({ ownerId: senderId })
-                : null
+            const recovery = await recoverFromDuplicateKey(
+                String(idempotencyKey),
+                expectedFingerprint
+            )
 
-            const existing = senderWallet
-                ? await transactionModel.findOne({
-                    idempotencyKey: String(idempotencyKey),
-                    senderWalletId: senderWallet._id
-                })
-                : null
-
-            if (existing) {
-
-                res.status(200).json({
-                    message: "Request already processed.",
-                    transaction: {
-                        id: existing._id,
-                        type: existing.type,
-                        amount: existing.amount,
-                        status: existing.status
-                    }
-                })
-
+            if (recovery.kind === "replay") {
+                res.status(200).json(replayResponse(recovery.transaction))
                 return
             }
 
             res.status(409).json({
-                message: "This Idempotency-Key has already been used."
+                message:
+                    "Idempotency-Key has already been used with different request parameters."
             })
-
             return
         }
 
@@ -701,11 +808,6 @@ export const transferMoney = async (
         res.status(500).json({
             message: "Internal server error."
         })
-
-    } finally {
-
-        await session?.endSession()
-
     }
 }
 
@@ -746,22 +848,53 @@ export const getTransactions = async (
                 ? Math.min(Math.floor(rawLimit), 100)
                 : 50
 
-        // Find transactions related to this wallet
+        // Cursor pagination on _id (which is time ordered) instead of
+        // skip/limit, so pages stay stable while new transactions are added
+        // and the database never has to scan everything before the page.
+        const rawCursor = req.query.cursor
+
+        const filter: QueryFilter<ITransaction> = {
+            $or: [
+                { walletId: wallet._id },
+                { senderWalletId: wallet._id },
+                { receiverWalletId: wallet._id }
+            ]
+        }
+
+        if (rawCursor !== undefined) {
+
+            if (typeof rawCursor !== "string" || !mongoose.isValidObjectId(rawCursor)) {
+                res.status(400).json({
+                    message: "Invalid cursor."
+                })
+                return
+            }
+
+            filter._id = { $lt: new mongoose.Types.ObjectId(rawCursor) }
+        }
+
+        // Fetch one extra row to learn whether another page exists without a
+        // second query. idempotencyKey and requestFingerprint are internal
+        // and are deliberately excluded from the response.
         const transactions = await transactionModel
-            .find({
-                $or: [
-                    { walletId: wallet._id },
-                    { senderWalletId: wallet._id },
-                    { receiverWalletId: wallet._id }
-                ]
-            })
-            .sort({ createdAt: -1 })
-            .limit(limit)
+            .find(filter)
+            .sort({ _id: -1 })
+            .limit(limit + 1)
+            .select(
+                "_id type amount currency status description walletId senderWalletId receiverWalletId createdAt updatedAt"
+            )
+            .lean()
+
+        const hasMore = transactions.length > limit
+        const page = hasMore ? transactions.slice(0, limit) : transactions
+        const nextCursor =
+            hasMore && page.length > 0 ? String(page[page.length - 1]._id) : null
 
         res.status(200).json({
             message: "Transactions fetched successfully.",
             limit,
-            transactions
+            nextCursor,
+            transactions: page
         })
 
     } catch (error) {
