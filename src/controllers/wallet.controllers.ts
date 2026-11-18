@@ -13,13 +13,19 @@ import ledgerModel from "../models/ledger.models"
 const MAX_TRANSACTION_AMOUNT_IN_PAISE = 100_000_000
 
 // Direct wallet top-ups bypass Razorpay, so any logged-in user could mint
-// money if this were always on. It stays available for local development but
-// is force-disabled when NODE_ENV=production unless explicitly opted in.
-// Real top-ups must go through the Razorpay create-order -> verify (or
-// webhook) flow.
+// money if this were always on. It fails closed: only an explicit opt-in or a
+// recognised local/test environment enables it. Missing, misspelled or
+// production-like NODE_ENV values can never enable it by accident.
+const normaliseEnv = (value: string | undefined): string =>
+    (value ?? "").trim().toLowerCase()
+
+const nodeEnv = normaliseEnv(process.env.NODE_ENV)
+const isDevelopment = ["development", "dev", "local", "test"].includes(nodeEnv)
+const directCreditFlag = normaliseEnv(process.env.ALLOW_DIRECT_WALLET_CREDIT)
+
 const directCreditEnabled =
-    process.env.ALLOW_DIRECT_WALLET_CREDIT === "true" ||
-    process.env.NODE_ENV !== "production"
+    directCreditFlag === "true" ||
+    (isDevelopment && directCreditFlag !== "false")
 
 // MongoDB reports a violated unique index with error code 11000. This is the
 // database-level guard that stops two concurrent requests that share an
@@ -186,10 +192,11 @@ const replayResponse = (transaction: ITransaction) => ({
 })
 
 
-// Two identical requests can still race past resolveIdempotency. The unique
-// index rejects one of them, and this rebuilds the replay (or a conflict) for
-// whichever request lost.
-const recoverFromDuplicateKey = async (
+// Two identical requests can still race past resolveIdempotency, and a
+// `withTransaction` commit can succeed even when the driver reports an
+// uncertain error. In both cases re-reading the key decides whether the
+// original result can safely be replayed.
+const recoverIdempotentResult = async (
     idempotencyKey: string,
     expectedFingerprint: string | undefined
 ): Promise<
@@ -348,10 +355,6 @@ export const addMoney = async (
                 throw new WalletRequestError(404, "Wallet not found.")
             }
 
-            if (wallet.status !== "active") {
-                throw new WalletRequestError(400, "Wallet is not active.")
-            }
-
             const fingerprint = walletFingerprint(
                 "CREDIT",
                 wallet._id,
@@ -360,7 +363,9 @@ export const addMoney = async (
             )
             expectedFingerprint = fingerprint
 
-            // Replays return the original result instead of crediting twice.
+            // Resolve the key BEFORE checking the current wallet status: a
+            // completed request must still be replayable if the wallet was
+            // frozen afterwards.
             const idempotency = await resolveIdempotency(
                 idempotencyKey,
                 fingerprint,
@@ -374,13 +379,25 @@ export const addMoney = async (
                 }
             }
 
+            if (wallet.status !== "active") {
+                throw new WalletRequestError(400, "Wallet is not active.")
+            }
+
             // Atomic credit. $inc avoids the lost-update race a
             // read-modify-write (wallet.balance += amount; wallet.save())
-            // would have with a concurrent credit or transfer.
+            // would have with a concurrent credit or transfer. The $expr
+            // guard refuses to operate on a wallet whose stored invariant is
+            // already broken; schema validators do not run for $inc.
             const updatedWallet = await walletModel.findOneAndUpdate(
                 {
                     _id: wallet._id,
-                    status: "active"
+                    status: "active",
+                    $expr: {
+                        $gte: [
+                            "$balance",
+                            { $ifNull: ["$reservedBalance", 0] }
+                        ]
+                    }
                 },
                 {
                     $inc: { balance: amountInPaise }
@@ -463,7 +480,7 @@ export const addMoney = async (
         // parameters match, otherwise report the key conflict.
         if (isDuplicateKeyError(error)) {
 
-            const recovery = await recoverFromDuplicateKey(
+            const recovery = await recoverIdempotentResult(
                 String(idempotencyKey),
                 expectedFingerprint
             )
@@ -477,6 +494,19 @@ export const addMoney = async (
                 message:
                     "Idempotency-Key has already been used with different request parameters."
             })
+            return
+        }
+
+        // withTransaction may report an error after the commit actually
+        // succeeded. Re-read the key before turning that into a 500 so a
+        // retried request returns the original transaction.
+        const recovery = await recoverIdempotentResult(
+            String(idempotencyKey),
+            expectedFingerprint
+        )
+
+        if (recovery.kind === "replay") {
+            res.status(200).json(replayResponse(recovery.transaction))
             return
         }
 
@@ -586,6 +616,32 @@ export const transferMoney = async (
                 throw new WalletRequestError(404, "Sender wallet not found.")
             }
 
+            // The receiver id is already validated, so the fingerprint can be
+            // built before loading the receiver wallet. That lets a completed
+            // transfer replay even if the receiver wallet is now unavailable.
+            const fingerprint = transferFingerprint(
+                senderWallet._id,
+                new mongoose.Types.ObjectId(receiverId),
+                amountInPaise,
+                senderWallet.currency
+            )
+            expectedFingerprint = fingerprint
+
+            // Resolve the key BEFORE the status/currency checks: a completed
+            // request must replay even if either wallet was frozen later.
+            const idempotency = await resolveIdempotency(
+                idempotencyKey,
+                fingerprint,
+                session
+            )
+
+            if (idempotency.kind === "replay") {
+                return {
+                    kind: "replay" as const,
+                    transaction: idempotency.transaction
+                }
+            }
+
             // Find receiver wallet
             const receiverWallet = await walletModel.findOne({
                 ownerId: receiverId
@@ -619,29 +675,6 @@ export const transferMoney = async (
                     400,
                     "Both wallets must use the same currency."
                 )
-            }
-
-            const fingerprint = transferFingerprint(
-                senderWallet._id,
-                receiverWallet._id,
-                amountInPaise,
-                senderWallet.currency
-            )
-            expectedFingerprint = fingerprint
-
-            // Replays return the original result instead of failing on the
-            // balance check below.
-            const idempotency = await resolveIdempotency(
-                idempotencyKey,
-                fingerprint,
-                session
-            )
-
-            if (idempotency.kind === "replay") {
-                return {
-                    kind: "replay" as const,
-                    transaction: idempotency.transaction
-                }
             }
 
             // Atomic sender debit. The $expr guard checks the spendable
@@ -679,7 +712,13 @@ export const transferMoney = async (
             const creditedReceiver = await walletModel.findOneAndUpdate(
                 {
                     _id: receiverWallet._id,
-                    status: "active"
+                    status: "active",
+                    $expr: {
+                        $gte: [
+                            "$balance",
+                            { $ifNull: ["$reservedBalance", 0] }
+                        ]
+                    }
                 },
                 {
                     $inc: { balance: amountInPaise }
@@ -786,7 +825,7 @@ export const transferMoney = async (
         // instead of a 500 so retrying a request is always safe.
         if (isDuplicateKeyError(error)) {
 
-            const recovery = await recoverFromDuplicateKey(
+            const recovery = await recoverIdempotentResult(
                 String(idempotencyKey),
                 expectedFingerprint
             )
@@ -800,6 +839,18 @@ export const transferMoney = async (
                 message:
                     "Idempotency-Key has already been used with different request parameters."
             })
+            return
+        }
+
+        // An uncertain commit error must not hide a transfer that already
+        // succeeded; replay it if the key proves the same request.
+        const recovery = await recoverIdempotentResult(
+            String(idempotencyKey),
+            expectedFingerprint
+        )
+
+        if (recovery.kind === "replay") {
+            res.status(200).json(replayResponse(recovery.transaction))
             return
         }
 

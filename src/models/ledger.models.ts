@@ -119,11 +119,37 @@ const ledgerSchema = new Schema<ILedger>(
 
 // A single transaction may only write one entry of a given type for a given
 // wallet. This blocks accidental double posting (for example a retried refund
-// writing the debit twice) at the database level.
+// writing the debit twice) at the database level. Keeping `type` also leaves
+// the two transfer rows distinct because their walletId differs. Tightening
+// this to (transactionId, walletId) requires a duplicate check on existing
+// data first, so it is deliberately not changed here.
 ledgerSchema.index(
     { transactionId: 1, walletId: 1, type: 1 },
     { unique: true }
 );
+
+// Ledger rows are append-only. Mongoose 9 pre hooks have no `next()`; throwing
+// aborts the operation before any database write is sent.
+ledgerSchema.pre("save", async function () {
+    if (!this.isNew && this.isModified()) {
+        throw new Error("Ledger entries are immutable.")
+    }
+})
+
+ledgerSchema.pre(
+    [
+        "updateOne",
+        "updateMany",
+        "replaceOne",
+        "findOneAndUpdate",
+        "deleteOne",
+        "deleteMany",
+        "findOneAndDelete"
+    ],
+    async function () {
+        throw new Error("Ledger entries are immutable.")
+    }
+)
 
 const ledgerModel = mongoose.model("Ledger", ledgerSchema)
 

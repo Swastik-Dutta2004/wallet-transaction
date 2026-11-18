@@ -1,10 +1,14 @@
 import dotenv from "dotenv";
+
+// Load .env before importing any route/controller: payment.controller creates
+// the Razorpay client at module load, and wallet.controllers derives
+// directCreditEnabled at module load as well. Both must see real values.
+dotenv.config();
+
 import express, { NextFunction, Request, Response } from "express"
 import authRoutes from "./routes/auth.routes"
 import walletRouter from "./routes/wallet.routes"
 import paymentRouter from "./routes/payment.routes"
-
-dotenv.config();
 
 const app = express()
 
