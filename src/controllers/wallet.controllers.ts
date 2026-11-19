@@ -12,6 +12,24 @@ import ledgerModel from "../models/ledger.models"
 // balances well inside Number.MAX_SAFE_INTEGER.
 const MAX_TRANSACTION_AMOUNT_IN_PAISE = 100_000_000
 
+// Idempotency keys are trimmed before use and capped so a single header
+// cannot be used to store unbounded strings in the database.
+const MAX_IDEMPOTENCY_KEY_LENGTH = 255
+
+const normaliseIdempotencyKey = (value: unknown): string | null => {
+    if (typeof value !== "string") {
+        return null
+    }
+
+    const key = value.trim()
+
+    if (key.length === 0 || key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+        return null
+    }
+
+    return key
+}
+
 // Direct wallet top-ups bypass Razorpay, so any logged-in user could mint
 // money if this were always on. It fails closed: only an explicit opt-in or a
 // recognised local/test environment enables it. Missing, misspelled or
@@ -37,6 +55,41 @@ const isDuplicateKeyError = (error: unknown): boolean =>
         "code" in error &&
         (error as { code?: unknown }).code === 11000
     )
+
+// Not every 11000 error is an idempotency conflict: any other unique index
+// can produce one. Prefer the driver's keyPattern/keyValue, then fall back to
+// the index name embedded in the error message.
+const isIdempotencyDuplicateKeyError = (error: unknown): boolean => {
+    if (!isDuplicateKeyError(error)) {
+        return false
+    }
+
+    const duplicate = error as {
+        keyPattern?: unknown;
+        keyValue?: unknown;
+        message?: string;
+        err?: string;
+    }
+
+    const keysOf = (value: unknown): string[] =>
+        value && typeof value === "object"
+            ? Object.keys(value as Record<string, unknown>)
+            : []
+
+    const patternKeys = keysOf(duplicate.keyPattern)
+    if (patternKeys.length > 0) {
+        return patternKeys.length === 1 && patternKeys[0] === "idempotencyKey"
+    }
+
+    const valueKeys = keysOf(duplicate.keyValue)
+    if (valueKeys.length > 0) {
+        return valueKeys.length === 1 && valueKeys[0] === "idempotencyKey"
+    }
+
+    const detail = `${duplicate.message ?? ""} ${duplicate.err ?? ""}`
+
+    return /index:\s*idempotencyKey_1\b/.test(detail)
+}
 
 
 // Expected business failures are thrown from inside a transaction so the
@@ -197,15 +250,19 @@ const replayResponse = (transaction: ITransaction) => ({
 // uncertain error. In both cases re-reading the key decides whether the
 // original result can safely be replayed.
 const recoverIdempotentResult = async (
-    idempotencyKey: string,
+    idempotencyKey: string | null,
     expectedFingerprint: string | undefined
 ): Promise<
     { kind: "replay"; transaction: ITransaction } | { kind: "conflict" }
 > => {
 
+    if (!idempotencyKey || !expectedFingerprint) {
+        return { kind: "conflict" }
+    }
+
     const existing = await transactionModel.findOne({ idempotencyKey })
 
-    if (!existing || !expectedFingerprint) {
+    if (!existing) {
         return { kind: "conflict" }
     }
 
@@ -275,7 +332,8 @@ export const addMoney = async (
     // Read these before the try block so the duplicate-key recovery path in
     // catch can use them.
     const { amount } = req.body ?? {}
-    const idempotencyKey = req.headers["idempotency-key"]
+    const rawIdempotencyKey = req.headers["idempotency-key"]
+    const idempotencyKey = normaliseIdempotencyKey(rawIdempotencyKey)
     const userId = req.user?.userId
 
     // Assigned inside the transaction; needed by duplicate-key recovery once
@@ -284,20 +342,12 @@ export const addMoney = async (
 
     try {
 
-        // Guard the insecure shortcut first: without this, any logged-in
-        // user can credit their own wallet with any amount they like.
-        if (!directCreditEnabled) {
-            res.status(403).json({
-                message:
-                    "Direct wallet credit is disabled. Add money through the Razorpay order and verification flow."
-            })
-            return
-        }
-
-        if (!idempotencyKey || typeof idempotencyKey !== "string") {
+        if (!idempotencyKey) {
 
             res.status(400).json({
-                message: "Idempotency-Key header is required."
+                message: rawIdempotencyKey === undefined
+                    ? "Idempotency-Key header is required."
+                    : "Invalid Idempotency-Key header."
             })
 
             return
@@ -377,6 +427,16 @@ export const addMoney = async (
                     kind: "replay" as const,
                     transaction: idempotency.transaction
                 }
+            }
+
+            // Only a NEW credit needs the feature flag. Replays of a
+            // previously successful request must stay available even after
+            // direct credit is turned off.
+            if (!directCreditEnabled) {
+                throw new WalletRequestError(
+                    403,
+                    "Direct wallet credit is disabled. Add money through the Razorpay order and verification flow."
+                )
             }
 
             if (wallet.status !== "active") {
@@ -475,13 +535,20 @@ export const addMoney = async (
             return
         }
 
-        // The unique index on Transaction.idempotencyKey rejected a
-        // concurrent duplicate. Return the winning transaction when the
-        // parameters match, otherwise report the key conflict.
+        // Only the idempotency-key index can be recovered as a replay. Other
+        // unique-index violations are unexpected database errors.
         if (isDuplicateKeyError(error)) {
 
+            if (!isIdempotencyDuplicateKeyError(error)) {
+                console.log("Add money error:", error)
+                res.status(500).json({
+                    message: "Internal server error."
+                })
+                return
+            }
+
             const recovery = await recoverIdempotentResult(
-                String(idempotencyKey),
+                idempotencyKey,
                 expectedFingerprint
             )
 
@@ -501,7 +568,7 @@ export const addMoney = async (
         // succeeded. Re-read the key before turning that into a 500 so a
         // retried request returns the original transaction.
         const recovery = await recoverIdempotentResult(
-            String(idempotencyKey),
+            idempotencyKey,
             expectedFingerprint
         )
 
@@ -527,7 +594,8 @@ export const transferMoney = async (
     // Read these before the try block so the duplicate-key recovery path in
     // catch can use them.
     const { receiverId, amount } = req.body ?? {}
-    const idempotencyKey = req.headers["idempotency-key"]
+    const rawIdempotencyKey = req.headers["idempotency-key"]
+    const idempotencyKey = normaliseIdempotencyKey(rawIdempotencyKey)
     const senderId = req.user?.userId
 
     // Assigned inside the transaction; needed by duplicate-key recovery once
@@ -536,10 +604,12 @@ export const transferMoney = async (
 
     try {
 
-        if (!idempotencyKey || typeof idempotencyKey !== "string") {
+        if (!idempotencyKey) {
 
             res.status(400).json({
-                message: "Idempotency-Key header is required."
+                message: rawIdempotencyKey === undefined
+                    ? "Idempotency-Key header is required."
+                    : "Invalid Idempotency-Key header."
             })
 
             return
@@ -820,13 +890,20 @@ export const transferMoney = async (
             return
         }
 
-        // A concurrent duplicate can lose the race on the unique
-        // Transaction.idempotencyKey index. Return the original transfer
-        // instead of a 500 so retrying a request is always safe.
+        // Only a genuine idempotency-key violation can be replayed; other
+        // duplicate-key errors stay ordinary database failures.
         if (isDuplicateKeyError(error)) {
 
+            if (!isIdempotencyDuplicateKeyError(error)) {
+                console.log("Transfer error:", error)
+                res.status(500).json({
+                    message: "Internal server error."
+                })
+                return
+            }
+
             const recovery = await recoverIdempotentResult(
-                String(idempotencyKey),
+                idempotencyKey,
                 expectedFingerprint
             )
 
@@ -845,7 +922,7 @@ export const transferMoney = async (
         // An uncertain commit error must not hide a transfer that already
         // succeeded; replay it if the key proves the same request.
         const recovery = await recoverIdempotentResult(
-            String(idempotencyKey),
+            idempotencyKey,
             expectedFingerprint
         )
 
