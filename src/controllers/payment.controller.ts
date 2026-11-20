@@ -266,7 +266,7 @@ export const verifyPayment = async (
 
         // Find user's wallet
 
-        const wallet = await Wallet.findOne({
+        let wallet = await Wallet.findOne({
             ownerId: userId
         }).session(session);
 
@@ -290,13 +290,26 @@ export const verifyPayment = async (
 
         // 10. Update wallet balance
 
-        const balanceBefore = wallet.balance;
+        const updatedWallet = await Wallet.findOneAndUpdate(
+            { _id: wallet._id, status: "active" },
+            { $inc: { balance: paymentOrder.amount } },
+            { new: true, runValidators: true, session }
+        );
 
-        wallet.balance += paymentOrder.amount;
+        if (!updatedWallet) {
+            await session.abortTransaction();
 
-        const balanceAfter = wallet.balance;
+            res.status(400).json({
+                message: "Wallet is not active."
+            });
+            return;
+        }
 
-        await wallet.save({ session });
+        wallet = updatedWallet;
+
+        const balanceAfter = updatedWallet.balance;
+
+        const balanceBefore = balanceAfter - paymentOrder.amount;
 
         // 11. Create Payment record
 
@@ -562,7 +575,7 @@ export const handleWebhook = async (
 
             // 11. Find user's wallet
 
-            const wallet = await Wallet.findOne({ ownerId: paymentOrder.userId }).session(session);
+            let wallet = await Wallet.findOne({ ownerId: paymentOrder.userId }).session(session);
 
             if (!wallet) {
 
@@ -588,17 +601,32 @@ export const handleWebhook = async (
                 return;
             }
 
-            // 13. Store balance before
+            // 13. Credit wallet and store post-update balances
 
-            const balanceBefore = wallet.balance;
+            const updatedWallet = await Wallet.findOneAndUpdate(
+                { _id: wallet._id, status: "active" },
+                { $inc: { balance: paymentOrder.amount } },
+                { new: true, runValidators: true, session }
+            );
 
-            // 14. Credit wallet
+            if (!updatedWallet) {
 
-            wallet.balance += paymentOrder.amount;
+                await session.abortTransaction();
 
-            const balanceAfter = wallet.balance;
+                res.status(400).json({
+                    message: "Wallet is not active."
+                });
 
-            await wallet.save({ session });
+                return;
+            }
+
+            wallet = updatedWallet;
+
+            // 14. Store balances for the ledger entry
+
+            const balanceAfter = updatedWallet.balance;
+
+            const balanceBefore = balanceAfter - paymentOrder.amount;
 
             // 15. Create Payment
 
