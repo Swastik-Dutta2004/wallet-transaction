@@ -262,123 +262,155 @@ export const verifyPayment = async (
 
         session = await mongoose.startSession();
 
-        session.startTransaction();
+        const txSession = session;
 
-        // Find user's wallet
+        const outcome = await txSession.withTransaction(async () => {
+            const existingPaymentInTransaction = await Payment.findOne({
+                razorpayPaymentId: razorpay_payment_id
+            }).session(txSession);
 
-        let wallet = await Wallet.findOne({
-            ownerId: userId
-        }).session(session);
+            if (existingPaymentInTransaction) {
+                return {
+                    kind: "already_processed" as const,
+                    paymentId: existingPaymentInTransaction.razorpayPaymentId
+                };
+            }
 
-        if (!wallet) {
-            await session.abortTransaction();
+            const existingTransactionInTransaction = await Transaction.findOne({
+                idempotencyKey: paymentOrder.idempotencyKey
+            }).session(txSession);
 
+            if (existingTransactionInTransaction) {
+                return {
+                    kind: "already_processed" as const,
+                    paymentId: razorpay_payment_id
+                };
+            }
+
+            // Find user's wallet
+
+            const wallet = await Wallet.findOne({
+                ownerId: userId
+            }).session(txSession);
+
+            if (!wallet) {
+                return { kind: "wallet_not_found" as const };
+            }
+
+            if (wallet.status !== "active") {
+                return { kind: "wallet_inactive" as const };
+            }
+
+            // 10. Update wallet balance
+
+            const updatedWallet = await Wallet.findOneAndUpdate(
+                { _id: wallet._id, status: "active" },
+                { $inc: { balance: paymentOrder.amount } },
+                { new: true, runValidators: true, session: txSession }
+            );
+
+            if (!updatedWallet) {
+                return { kind: "wallet_inactive" as const };
+            }
+
+            const balanceAfter = updatedWallet.balance;
+
+            const balanceBefore = balanceAfter - paymentOrder.amount;
+
+            // 11. Create Payment record
+
+            const payment = new Payment({
+                userId,
+                razorpayOrderId: razorpay_order_id,
+                razorpayPaymentId: razorpay_payment_id,
+                razorpaySignature: razorpay_signature,
+                amount: paymentOrder.amount,
+                currency: paymentOrder.currency,
+                status: "SUCCESS"
+            });
+
+            await payment.save({ session: txSession });
+
+            // 12. Create wallet transaction
+
+            const transaction = new Transaction({
+                walletId: updatedWallet._id,
+                type: "CREDIT",
+                amount: paymentOrder.amount,
+                currency: paymentOrder.currency,
+                status: "Success",
+
+                // Reuse the PaymentOrder idempotency key so this write is
+                // deduped against the webhook credit path for the same order
+                idempotencyKey: paymentOrder.idempotencyKey,
+
+                description: "Money added through Razorpay"
+            });
+
+            await transaction.save({ session: txSession });
+
+            // 13. Create ledger entry
+
+            const ledger = new Ledger({
+                walletId: updatedWallet._id,
+                transactionId: transaction._id,
+                type: "CREDIT",
+                amount: paymentOrder.amount,
+                balanceBefore,
+                balanceAfter,
+                currency: paymentOrder.currency,
+                description: "Razorpay wallet recharge"
+            });
+
+            await ledger.save({ session: txSession });
+
+            // 14. Update PaymentOrder
+
+            paymentOrder.status = "PAID";
+            paymentOrder.markModified("status");
+
+            await paymentOrder.save({ session: txSession });
+
+            return {
+                kind: "created" as const,
+                payment,
+                wallet: updatedWallet
+            };
+        });
+
+        if (outcome.kind === "wallet_not_found") {
             res.status(404).json({
                 message: "Wallet not found."
             });
             return;
         }
 
-        if (wallet.status !== "active") {
-            await session.abortTransaction();
-
+        if (outcome.kind === "wallet_inactive") {
             res.status(400).json({
                 message: "Wallet is not active."
             });
             return;
         }
 
-        // 10. Update wallet balance
-
-        const updatedWallet = await Wallet.findOneAndUpdate(
-            { _id: wallet._id, status: "active" },
-            { $inc: { balance: paymentOrder.amount } },
-            { new: true, runValidators: true, session }
-        );
-
-        if (!updatedWallet) {
-            await session.abortTransaction();
-
-            res.status(400).json({
-                message: "Wallet is not active."
+        if (outcome.kind === "already_processed") {
+            res.status(200).json({
+                message: "Payment has already been processed.",
+                paymentId: outcome.paymentId
             });
             return;
         }
-
-        wallet = updatedWallet;
-
-        const balanceAfter = updatedWallet.balance;
-
-        const balanceBefore = balanceAfter - paymentOrder.amount;
-
-        // 11. Create Payment record
-
-        const payment = new Payment({
-            userId,
-            razorpayOrderId: razorpay_order_id,
-            razorpayPaymentId: razorpay_payment_id,
-            razorpaySignature: razorpay_signature,
-            amount: paymentOrder.amount,
-            currency: paymentOrder.currency,
-            status: "SUCCESS"
-        });
-
-        await payment.save({ session });
-
-        // 12. Create wallet transaction
-
-        const transaction = new Transaction({
-            walletId: wallet._id,
-            type: "CREDIT",
-            amount: paymentOrder.amount,
-            currency: paymentOrder.currency,
-            status: "Success",
-
-            // Reuse the PaymentOrder idempotency key so this write is
-            // deduped against the webhook credit path for the same order
-            idempotencyKey: paymentOrder.idempotencyKey,
-
-            description: "Money added through Razorpay"
-        });
-
-        await transaction.save({ session });
-
-        // 13. Create ledger entry
-
-        const ledger = new Ledger({
-            walletId: wallet._id,
-            transactionId: transaction._id,
-            type: "CREDIT",
-            amount: paymentOrder.amount,
-            balanceBefore,
-            balanceAfter,
-            currency: paymentOrder.currency,
-            description: "Razorpay wallet recharge"
-        });
-
-        await ledger.save({ session });
-
-        // 14. Update PaymentOrder
-
-        paymentOrder.status = "PAID";
-
-        await paymentOrder.save({ session });
-
-        // 15. Commit everything
-
-        await session.commitTransaction();
 
         res.status(200).json({
             message: "Payment verified and wallet credited successfully.",
             payment: {
-                paymentId: payment.razorpayPaymentId,
-                orderId: payment.razorpayOrderId,
-                amount: payment.amount,
-                currency: payment.currency
+                paymentId: outcome.payment.razorpayPaymentId,
+                orderId: outcome.payment.razorpayOrderId,
+                amount: outcome.payment.amount,
+                currency: outcome.payment.currency
             },
             wallet: {
-                balance: wallet.balance,
-                currency: wallet.currency
+                balance: outcome.wallet.balance,
+                currency: outcome.wallet.currency
             }
         });
 
@@ -386,6 +418,13 @@ export const verifyPayment = async (
 
         if (session?.inTransaction()) {
             await session.abortTransaction();
+        }
+
+        if (isDuplicateKeyError(error)) {
+            res.status(200).json({
+                message: "Payment has already been processed."
+            });
+            return;
         }
 
         console.error("Payment verification error:", error);
@@ -554,149 +593,150 @@ export const handleWebhook = async (
 
             session = await mongoose.startSession();
 
-            session.startTransaction();
+            const txSession = session;
 
-            // 10. Re-check inside transaction
-            // Protects against simultaneous webhook requests
+            const outcome = await txSession.withTransaction(async () => {
+                // 10. Re-check inside transaction
+                // Protects against simultaneous webhook requests
 
-            const existingTransaction =
-                await Transaction.findOne({ idempotencyKey: paymentOrder.idempotencyKey }).session(session);
+                const existingPaymentInTransaction =
+                    await Payment.findOne({
+                        razorpayPaymentId
+                    }).session(txSession);
 
-            if (existingTransaction) {
+                if (existingPaymentInTransaction) {
+                    return { kind: "already_processed" as const };
+                }
 
-                await session.commitTransaction();
+                const existingTransaction =
+                    await Transaction.findOne({ idempotencyKey: paymentOrder.idempotencyKey }).session(txSession);
 
+                if (existingTransaction) {
+                    return { kind: "already_processed" as const };
+                }
+
+                // 11. Find user's wallet
+
+                const wallet = await Wallet.findOne({ ownerId: paymentOrder.userId }).session(txSession);
+
+                if (!wallet) {
+                    return { kind: "wallet_not_found" as const };
+                }
+
+                // 12. Check wallet status
+
+                if (wallet.status !== "active") {
+                    return { kind: "wallet_inactive" as const };
+                }
+
+                // 13. Credit wallet and store post-update balances
+
+                const updatedWallet = await Wallet.findOneAndUpdate(
+                    { _id: wallet._id, status: "active" },
+                    { $inc: { balance: paymentOrder.amount } },
+                    { new: true, runValidators: true, session: txSession }
+                );
+
+                if (!updatedWallet) {
+                    return { kind: "wallet_inactive" as const };
+                }
+
+                // 14. Store balances for the ledger entry
+
+                const balanceAfter = updatedWallet.balance;
+
+                const balanceBefore = balanceAfter - paymentOrder.amount;
+
+                // 15. Create Payment
+
+                const payment = new Payment({
+                    userId: paymentOrder.userId,
+                    razorpayOrderId,
+                    razorpayPaymentId,
+                    // NOTE: the x-razorpay-signature header is a WEBHOOK
+                    // signature (HMAC of the raw body). It is not the Razorpay
+                    // Checkout signature, so it is deliberately NOT stored in
+                    // razorpaySignature. That field is left empty for payments
+                    // first seen through a webhook.
+                    amount: paymentOrder.amount,
+                    currency: paymentOrder.currency,
+                    status: "SUCCESS"
+                });
+
+                await payment.save({ session: txSession });
+
+                // 16. Create Transaction
+
+                const transaction = new Transaction({
+                    walletId: updatedWallet._id,
+                    type: "CREDIT",
+                    amount: paymentOrder.amount,
+                    currency: paymentOrder.currency,
+                    status: "Success",
+
+                    // IMPORTANT:
+                    // Reuse the idempotency key
+                    // from PaymentOrder
+
+                    idempotencyKey: paymentOrder.idempotencyKey,
+
+                    description: "Money added through Razorpay webhook"
+                });
+
+                await transaction.save({
+                    session: txSession
+                });
+
+                // 17. Create Ledger
+
+                const ledger = new Ledger({
+                    walletId: updatedWallet._id,
+                    transactionId: transaction._id,
+                    type: "CREDIT",
+                    amount: paymentOrder.amount,
+                    balanceBefore,
+                    balanceAfter,
+                    currency: paymentOrder.currency,
+                    description:
+                        "Razorpay wallet recharge"
+                });
+
+                await ledger.save({
+                    session: txSession
+                });
+
+                // 18. Mark PaymentOrder as PAID
+
+                paymentOrder.status = "PAID";
+                paymentOrder.markModified("status");
+
+                await paymentOrder.save({
+                    session: txSession
+                });
+
+                return { kind: "created" as const };
+            });
+
+            if (outcome.kind === "already_processed") {
                 res.status(200).json({
                     message: "Payment already processed."
                 });
-
                 return;
             }
 
-            // 11. Find user's wallet
-
-            let wallet = await Wallet.findOne({ ownerId: paymentOrder.userId }).session(session);
-
-            if (!wallet) {
-
-                await session.abortTransaction();
-
+            if (outcome.kind === "wallet_not_found") {
                 res.status(404).json({
                     message: "Wallet not found."
                 });
-
                 return;
             }
 
-            // 12. Check wallet status
-
-            if (wallet.status !== "active") {
-
-                await session.abortTransaction();
-
+            if (outcome.kind === "wallet_inactive") {
                 res.status(400).json({
                     message: "Wallet is not active."
                 });
-
                 return;
             }
-
-            // 13. Credit wallet and store post-update balances
-
-            const updatedWallet = await Wallet.findOneAndUpdate(
-                { _id: wallet._id, status: "active" },
-                { $inc: { balance: paymentOrder.amount } },
-                { new: true, runValidators: true, session }
-            );
-
-            if (!updatedWallet) {
-
-                await session.abortTransaction();
-
-                res.status(400).json({
-                    message: "Wallet is not active."
-                });
-
-                return;
-            }
-
-            wallet = updatedWallet;
-
-            // 14. Store balances for the ledger entry
-
-            const balanceAfter = updatedWallet.balance;
-
-            const balanceBefore = balanceAfter - paymentOrder.amount;
-
-            // 15. Create Payment
-
-            const payment = new Payment({
-                userId: paymentOrder.userId,
-                razorpayOrderId,
-                razorpayPaymentId,
-                // NOTE: the x-razorpay-signature header is a WEBHOOK
-                // signature (HMAC of the raw body). It is not the Razorpay
-                // Checkout signature, so it is deliberately NOT stored in
-                // razorpaySignature. That field is left empty for payments
-                // first seen through a webhook.
-                amount: paymentOrder.amount,
-                currency: paymentOrder.currency,
-                status: "SUCCESS"
-            });
-
-            await payment.save({ session });
-
-            // 16. Create Transaction
-
-            const transaction = new Transaction({
-                walletId: wallet._id,
-                type: "CREDIT",
-                amount: paymentOrder.amount,
-                currency: paymentOrder.currency,
-                status: "Success",
-
-                // IMPORTANT:
-                // Reuse the idempotency key
-                // from PaymentOrder
-
-                idempotencyKey: paymentOrder.idempotencyKey,
-
-                description: "Money added through Razorpay webhook"
-            });
-
-            await transaction.save({
-                session
-            });
-
-            // 17. Create Ledger
-
-            const ledger = new Ledger({
-                walletId: wallet._id,
-                transactionId: transaction._id,
-                type: "CREDIT",
-                amount: paymentOrder.amount,
-                balanceBefore,
-                balanceAfter,
-                currency: paymentOrder.currency,
-                description:
-                    "Razorpay wallet recharge"
-            });
-
-            await ledger.save({
-                session
-            });
-
-            // 18. Mark PaymentOrder as PAID
-
-            paymentOrder.status = "PAID";
-
-            await paymentOrder.save({
-                session
-            });
-
-            // 19. Commit everything
-
-            await session.commitTransaction();
 
             console.log(
                 "Wallet credited successfully:",
@@ -737,17 +777,10 @@ export const handleWebhook = async (
 
             // Find our PaymentOrder
 
-            const paymentOrder =
-                await PaymentOrder.findOne({
-                    razorpayOrderId
-                });
-
-            if (paymentOrder) {
-
-                paymentOrder.status = "FAILED";
-
-                await paymentOrder.save();
-            }
+            await PaymentOrder.findOneAndUpdate(
+                { razorpayOrderId, status: "CREATED" },
+                { $set: { status: "FAILED" } }
+            );
 
             res.status(200).json({
                 message: "Payment failure webhook processed."
