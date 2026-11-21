@@ -1,5 +1,11 @@
 import mongoose, {Document, Schema, Types} from "mongoose"
 
+const isPaiseAmount = (value: number): boolean =>
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value >= 0
+
 export interface IWallet extends Document{
     ownerId: Types.ObjectId,
     balance: number,
@@ -31,17 +37,9 @@ const walletSchema = new Schema<IWallet>({
         default: 0,
         min: 0,
 
-        // Reserved funds are still part of `balance` but may not be spent,
-        // so the reserved amount can never exceed the total. Enforced on
-        // `balance` because it is always present, unlike reservedBalance on
-        // legacy documents.
         validate: {
-            validator: function (value: number): boolean {
-                const wallet = this as unknown as { reservedBalance?: number }
-
-                return (wallet.reservedBalance ?? 0) <= value
-            },
-            message: "reservedBalance cannot exceed balance"
+            validator: (value: number): boolean => isPaiseAmount(value),
+            message: "balance must be a finite non-negative integer number of paise"
         }
     },
 
@@ -49,13 +47,22 @@ const walletSchema = new Schema<IWallet>({
         type: Number,
         required: true,
         default: 0,
-        min: 0
+        min: 0,
+
+        validate: {
+            validator: (value: number): boolean => isPaiseAmount(value),
+            message:
+                "reservedBalance must be a finite non-negative integer number of paise"
+        }
     },
 
     currency: {
         type : String,
         required: true,
-        default: "INR"
+        default: "INR",
+        enum: ["INR"],
+        trim: true,
+        uppercase: true
     },
 
     status: {
@@ -66,6 +73,20 @@ const walletSchema = new Schema<IWallet>({
 }, {
     timestamps: true
 })
+
+walletSchema.path("balance").validate(
+    function (this: IWallet, value: number): boolean {
+        return (this.reservedBalance ?? 0) <= value
+    },
+    "reservedBalance cannot exceed balance"
+)
+
+walletSchema.path("reservedBalance").validate(
+    function (this: IWallet, value: number): boolean {
+        return value <= (this.balance ?? 0)
+    },
+    "reservedBalance cannot exceed balance"
+)
 
 const walletModel = mongoose.model("Wallet", walletSchema)
 
