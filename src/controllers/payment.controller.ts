@@ -1323,94 +1323,150 @@ async function releaseRefundReservation(
 ): Promise<RefundStatus> {
 
     let session: mongoose.ClientSession | undefined;
+    let completed = false;
+    let statusAfterAttempt: RefundStatus | undefined;
 
     try {
         session = await mongoose.startSession();
-        session.startTransaction();
+        const txSession = session;
 
-        const refund = await Refund.findOneAndUpdate(
-            { _id: refundId, status: { $in: ["CREATED", "PENDING"] } },
-            {
-                $set: {
-                    status: "FAILED",
-                    requiresReconciliation: false,
-                    failureReason,
-                    finalizedAt: new Date()
-                }
-            },
-            { new: true, session }
-        );
+        await txSession.withTransaction(async () => {
+            completed = false;
+            statusAfterAttempt = undefined;
 
-        if (!refund) {
-            if (session.inTransaction()) {
-                await session.abortTransaction();
+            const refund = await Refund.findOneAndUpdate(
+                { _id: refundId, status: { $in: ["CREATED", "PENDING"] } },
+                {
+                    $set: {
+                        status: "FAILED",
+                        requiresReconciliation: false,
+                        failureReason,
+                        finalizedAt: new Date()
+                    }
+                },
+                { new: true, session: txSession }
+            );
+
+            if (!refund) {
+                const current = await Refund.findById(refundId)
+                    .session(txSession);
+
+                statusAfterAttempt = current?.status ?? "FAILED";
+                return;
             }
 
-            const current = await Refund.findById(refundId);
-            return current?.status ?? "FAILED";
-        }
+            // Only give back what was actually reserved.
+            if (refund.reservationActive) {
+                const paymentResult = await Payment.updateOne(
+                    {
+                        _id: refund.paymentId,
+                        $expr: {
+                            $gte: [
+                                { $ifNull: ["$reservedRefundAmount", 0] },
+                                refund.amount
+                            ]
+                        }
+                    },
+                    { $inc: { reservedRefundAmount: -refund.amount } },
+                    { session: txSession }
+                );
 
-        // Only give back what was actually reserved.
-        if (refund.reservationActive) {
-            const paymentResult = await Payment.updateOne(
-                {
-                    _id: refund.paymentId,
-                    $expr: {
-                        $gte: [
-                            { $ifNull: ["$reservedRefundAmount", 0] },
-                            refund.amount
-                        ]
-                    }
-                },
-                { $inc: { reservedRefundAmount: -refund.amount } },
-                { session }
-            );
+                const walletResult = await Wallet.updateOne(
+                    {
+                        ownerId: refund.userId,
+                        $expr: {
+                            $gte: [
+                                { $ifNull: ["$reservedBalance", 0] },
+                                refund.amount
+                            ]
+                        }
+                    },
+                    { $inc: { reservedBalance: -refund.amount } },
+                    { session: txSession }
+                );
 
-            const walletResult = await Wallet.updateOne(
-                {
-                    ownerId: refund.userId,
-                    $expr: {
-                        $gte: [
-                            { $ifNull: ["$reservedBalance", 0] },
-                            refund.amount
-                        ]
-                    }
-                },
-                { $inc: { reservedBalance: -refund.amount } },
-                { session }
-            );
+                // If either guarded decrement matched nothing, the stored
+                // counters and the refund row disagree. Abort instead of
+                // marking the refund FAILED while funds may still be held.
+                if (
+                    paymentResult.matchedCount === 0 ||
+                    walletResult.matchedCount === 0
+                ) {
+                    throw new Error(
+                        "Refund reservation counters are inconsistent."
+                    );
+                }
 
-            // If either guarded decrement matched nothing, the stored
-            // counters and the refund row disagree. Abort instead of
-            // marking the refund FAILED while funds may still be held.
-            if (
-                paymentResult.matchedCount === 0 ||
-                walletResult.matchedCount === 0
-            ) {
-                throw new Error(
-                    "Refund reservation counters are inconsistent."
+                await Refund.updateOne(
+                    { _id: refund._id },
+                    { $set: { reservationActive: false } },
+                    { session: txSession }
                 );
             }
 
-            await Refund.updateOne(
-                { _id: refund._id },
-                { $set: { reservationActive: false } },
-                { session }
-            );
+            completed = true;
+        });
+
+        if (completed) {
+            const current = await Refund.findById(refundId).catch((readError) => {
+                console.error(
+                    "CRITICAL: could not read refund after release completion.",
+                    { refundId, readError }
+                );
+                return null;
+            });
+            return current?.status ?? "FAILED";
         }
 
-        await session.commitTransaction();
+        if (statusAfterAttempt) {
+            return statusAfterAttempt;
+        }
 
-        const current = await Refund.findById(refundId);
+        const current = await Refund.findById(refundId).catch((readError) => {
+            console.error(
+                "CRITICAL: could not read refund after release attempt.",
+                { refundId, readError }
+            );
+            return null;
+        });
         return current?.status ?? "FAILED";
 
     } catch (error) {
 
-        if (session?.inTransaction()) {
-            await session.abortTransaction();
+        const uncertainCommit = isUnknownTransactionCommitResult(error);
+
+        if (!uncertainCommit && session?.inTransaction()) {
+            try {
+                await session.abortTransaction();
+            } catch (abortError) {
+                console.error("Refund release abort failed:", {
+                    refundId,
+                    abortError
+                });
+            }
         }
 
-        console.error("Refund release failed:", { refundId, error });
+        console.error("Refund release failed:", {
+            refundId,
+            uncertainCommit,
+            error
+        });
+
+        const currentBeforeRecovery =
+            await Refund.findById(refundId).catch((readError) => {
+                console.error(
+                    "CRITICAL: could not read refund after release failure.",
+                    { refundId, readError }
+                );
+                return null;
+            });
+
+        if (
+            currentBeforeRecovery?.status === "PROCESSED" ||
+            currentBeforeRecovery?.status === "FAILED"
+        ) {
+            return currentBeforeRecovery.status;
+        }
 
         // We could not safely give the reservation back. Keep a non-final row
         // PENDING and flag it, rather than pretending it failed while funds
@@ -1425,7 +1481,9 @@ async function releaseRefundReservation(
                     $set: {
                         status: "PENDING",
                         requiresReconciliation: true,
-                        failureReason: "Could not release the refund reservation."
+                        failureReason: uncertainCommit
+                            ? "Could not confirm whether the refund reservation was released."
+                            : "Could not release the refund reservation."
                     }
                 }
             );
@@ -1436,8 +1494,15 @@ async function releaseRefundReservation(
             );
         }
 
-        const current = await Refund.findById(refundId);
-        return current?.status ?? "PENDING";
+        const current = await Refund.findById(refundId).catch((readError) => {
+            console.error(
+                "CRITICAL: could not read refund after release recovery.",
+                { refundId, readError }
+            );
+            return null;
+        });
+
+        return current?.status ?? currentBeforeRecovery?.status ?? "PENDING";
 
     } finally {
         await session?.endSession();
