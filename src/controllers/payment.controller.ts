@@ -2290,22 +2290,173 @@ export const reconcileRefund = async (
         const REFUND_PAGE_SIZE = 100;
         const MAX_REFUND_PAGES = 20;
 
+        const respondWithFinalStatusIfChanged = async (): Promise<boolean> => {
+            const current = await Refund.findById(refund._id);
+
+            if (
+                current &&
+                (current.status === "PROCESSED" || current.status === "FAILED")
+            ) {
+                res.status(200).json({
+                    message: "Refund is already final.",
+                    refund: serializeRefund(current)
+                });
+                return true;
+            }
+
+            return false;
+        };
+
+        const validateRazorpayRefund = (
+            candidate: Refunds.RazorpayRefund,
+            expectedRazorpayRefundId?: string
+        ): string[] => {
+            const mismatches: string[] = [];
+
+            if (
+                typeof candidate.id !== "string" ||
+                candidate.id.length === 0
+            ) {
+                mismatches.push("id");
+            } else if (
+                expectedRazorpayRefundId &&
+                candidate.id !== expectedRazorpayRefundId
+            ) {
+                mismatches.push("id");
+            }
+
+            if (candidate.payment_id !== refund.razorpayPaymentId) {
+                mismatches.push("payment_id");
+            }
+
+            if (candidate.amount !== refund.amount) {
+                mismatches.push("amount");
+            }
+
+            if (candidate.currency !== refund.currency) {
+                mismatches.push("currency");
+            }
+
+            if (
+                candidate.receipt !== undefined &&
+                candidate.receipt !== null &&
+                candidate.receipt !== refund.idempotencyKey
+            ) {
+                mismatches.push("receipt");
+            }
+
+            return mismatches;
+        };
+
         const markReconciliationPending = async (
             failureReason: string
-        ): Promise<void> => {
-            await Refund.updateOne(
-                {
-                    _id: refund._id,
-                    status: { $in: ["CREATED", "PENDING"] }
-                },
-                {
-                    $set: {
-                        status: "PENDING",
-                        requiresReconciliation: true,
-                        failureReason
+        ): Promise<boolean> => {
+            const current = await Refund.findById(refund._id);
+
+            if (!current) {
+                return false;
+            }
+
+            if (
+                current.status === "PROCESSED" ||
+                current.status === "FAILED"
+            ) {
+                return false;
+            }
+
+            if (current.reservationActive) {
+                const result = await Refund.updateOne(
+                    {
+                        _id: refund._id,
+                        status: { $in: ["CREATED", "PENDING"] },
+                        reservationActive: true
+                    },
+                    {
+                        $set: {
+                            status: "PENDING",
+                            requiresReconciliation: true,
+                            failureReason
+                        }
                     }
+                );
+
+                if (result.matchedCount > 0) {
+                    return true;
+                }
+            } else {
+                console.error(
+                    "Refund reconciliation found an inactive reservation; flagging without status change.",
+                    { refundId: String(refund._id), status: current.status }
+                );
+
+                const result = await Refund.updateOne(
+                    {
+                        _id: refund._id,
+                        status: { $in: ["CREATED", "PENDING"] },
+                        reservationActive: false
+                    },
+                    {
+                        $set: {
+                            requiresReconciliation: true,
+                            failureReason
+                        }
+                    }
+                );
+
+                if (result.matchedCount > 0) {
+                    return true;
+                }
+            }
+
+            const latest = await Refund.findById(refund._id);
+
+            console.error(
+                "Refund reconciliation state changed before reconciliation flag was written.",
+                { refundId: String(refund._id), status: latest?.status }
+            );
+
+            return false;
+        };
+
+        const rejectMismatchedRazorpayRefund = async (
+            candidate: Refunds.RazorpayRefund,
+            mismatches: string[]
+        ): Promise<void> => {
+            console.error(
+                "Refund reconciliation rejected a mismatched Razorpay refund.",
+                {
+                    refundId: String(refund._id),
+                    mismatches,
+                    expectedRazorpayRefundId: refund.razorpayRefundId,
+                    actualRazorpayRefundId: candidate.id,
+                    expectedRazorpayPaymentId: refund.razorpayPaymentId,
+                    actualRazorpayPaymentId: candidate.payment_id,
+                    expectedAmount: refund.amount,
+                    actualAmount: candidate.amount,
+                    expectedCurrency: refund.currency,
+                    actualCurrency: candidate.currency,
+                    receiptMatched:
+                        candidate.receipt === undefined ||
+                        candidate.receipt === null ||
+                        candidate.receipt === refund.idempotencyKey
                 }
             );
+
+            const flagged = await markReconciliationPending(
+                "Razorpay refund identity or financial fields did not match the local refund."
+            );
+
+            if (!flagged && await respondWithFinalStatusIfChanged()) {
+                return;
+            }
+
+            const updated = await Refund.findById(refund._id);
+
+            res.status(502).json({
+                message: "Could not confirm the refund with Razorpay yet.",
+                refund: updated ? serializeRefund(updated) : undefined,
+                requiresReconciliation: true
+            });
         };
 
         // Ask Razorpay for the current state.
@@ -2319,10 +2470,19 @@ export const reconcileRefund = async (
                     refund.razorpayRefundId
                 );
 
-                if (fetchedRefund.payment_id === refund.razorpayPaymentId) {
+                const mismatches = validateRazorpayRefund(
+                    fetchedRefund,
+                    refund.razorpayRefundId
+                );
+
+                if (mismatches.length === 0) {
                     razorpayRefund = fetchedRefund;
                 } else {
-                    searchComplete = false;
+                    await rejectMismatchedRazorpayRefund(
+                        fetchedRefund,
+                        mismatches
+                    );
+                    return;
                 }
             } else {
                 let skip = 0;
@@ -2343,13 +2503,41 @@ export const reconcileRefund = async (
                         break;
                     }
 
-                    razorpayRefund = refunds.items.find(
-                        (item) =>
-                            item.receipt === refund.idempotencyKey &&
-                            item.payment_id === refund.razorpayPaymentId &&
-                            item.amount === refund.amount &&
-                            item.currency === refund.currency
-                    ) as Refunds.RazorpayRefund | undefined;
+                    let mismatchedRazorpayRefund:
+                        Refunds.RazorpayRefund | undefined;
+                    let mismatchFields: string[] | undefined;
+
+                    for (const item of refunds.items) {
+                        const matchesSearchKey =
+                            item.receipt !== undefined && item.receipt !== null
+                                ? item.receipt === refund.idempotencyKey
+                                : item.payment_id === refund.razorpayPaymentId &&
+                                    item.amount === refund.amount &&
+                                    item.currency === refund.currency;
+
+                        if (!matchesSearchKey) {
+                            continue;
+                        }
+
+                        const mismatches = validateRazorpayRefund(item);
+
+                        if (mismatches.length > 0) {
+                            mismatchedRazorpayRefund = item;
+                            mismatchFields = mismatches;
+                            break;
+                        }
+
+                        razorpayRefund = item;
+                        break;
+                    }
+
+                    if (mismatchedRazorpayRefund && mismatchFields) {
+                        await rejectMismatchedRazorpayRefund(
+                            mismatchedRazorpayRefund,
+                            mismatchFields
+                        );
+                        return;
+                    }
 
                     if (razorpayRefund) {
                         searchComplete = true;
@@ -2366,9 +2554,13 @@ export const reconcileRefund = async (
                 }
             }
         } catch (fetchError) {
-            await markReconciliationPending(
+            const flagged = await markReconciliationPending(
                 "Razorpay refund lookup failed during reconciliation."
             );
+
+            if (!flagged && await respondWithFinalStatusIfChanged()) {
+                return;
+            }
 
             console.error("Refund reconciliation fetch failed:", {
                 refundId: String(refund._id),
@@ -2386,9 +2578,13 @@ export const reconcileRefund = async (
         }
 
         if (!searchComplete) {
-            await markReconciliationPending(
+            const flagged = await markReconciliationPending(
                 "Razorpay refund lookup was incomplete during reconciliation."
             );
+
+            if (!flagged && await respondWithFinalStatusIfChanged()) {
+                return;
+            }
 
             const updated = await Refund.findById(refund._id);
 
@@ -2401,10 +2597,20 @@ export const reconcileRefund = async (
         }
 
         if (razorpayRefund && !refund.razorpayRefundId) {
-            await Refund.updateOne(
-                { _id: refund._id },
+            const persisted = await Refund.updateOne(
+                {
+                    _id: refund._id,
+                    status: { $in: ["CREATED", "PENDING"] }
+                },
                 { $set: { razorpayRefundId: razorpayRefund.id } }
             );
+
+            if (
+                persisted.matchedCount === 0 &&
+                await respondWithFinalStatusIfChanged()
+            ) {
+                return;
+            }
         }
 
         if (!razorpayRefund) {
@@ -2449,12 +2655,76 @@ export const reconcileRefund = async (
             return;
         }
 
-        // Still pending at Razorpay. Clear the reconciliation flag and keep
-        // the reservation.
-        await Refund.updateOne(
-            { _id: refund._id, status: { $ne: "PROCESSED" } },
-            { $set: { status: "PENDING", requiresReconciliation: false } }
-        );
+        // Still pending at Razorpay. Re-read the local row first so a
+        // concurrent webhook cannot be overwritten with stale PENDING data.
+        const currentBeforePendingUpdate = await Refund.findById(refund._id);
+
+        if (
+            !currentBeforePendingUpdate ||
+            currentBeforePendingUpdate.status === "PROCESSED" ||
+            currentBeforePendingUpdate.status === "FAILED"
+        ) {
+            if (await respondWithFinalStatusIfChanged()) {
+                return;
+            }
+
+            res.status(404).json({
+                message: "Refund not found."
+            });
+            return;
+        }
+
+        if (!currentBeforePendingUpdate.reservationActive) {
+            console.error(
+                "Refund reconciliation found a pending Razorpay refund without an active local reservation.",
+                {
+                    refundId: String(refund._id),
+                    status: currentBeforePendingUpdate.status
+                }
+            );
+
+            const flagged = await Refund.updateOne(
+                {
+                    _id: refund._id,
+                    status: { $in: ["CREATED", "PENDING"] },
+                    reservationActive: false
+                },
+                {
+                    $set: {
+                        requiresReconciliation: true,
+                        failureReason: "Razorpay still reports this refund as pending but the local reservation is inactive."
+                    }
+                }
+            );
+
+            if (
+                flagged.matchedCount === 0 &&
+                await respondWithFinalStatusIfChanged()
+            ) {
+                return;
+            }
+        } else {
+            const cleared = await Refund.updateOne(
+                {
+                    _id: refund._id,
+                    status: { $in: ["CREATED", "PENDING"] },
+                    reservationActive: true
+                },
+                {
+                    $set: {
+                        status: "PENDING",
+                        requiresReconciliation: false
+                    }
+                }
+            );
+
+            if (
+                cleared.matchedCount === 0 &&
+                await respondWithFinalStatusIfChanged()
+            ) {
+                return;
+            }
+        }
 
         const updated = await Refund.findById(refund._id);
 
