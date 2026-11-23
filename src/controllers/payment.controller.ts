@@ -1468,14 +1468,24 @@ async function releaseRefundReservation(
             return currentBeforeRecovery.status;
         }
 
+        if (currentBeforeRecovery && !currentBeforeRecovery.reservationActive) {
+            console.error(
+                "Refund release recovery skipped because the reservation is inactive.",
+                { refundId, status: currentBeforeRecovery.status }
+            );
+            return currentBeforeRecovery.status;
+        }
+
         // We could not safely give the reservation back. Keep a non-final row
-        // PENDING and flag it, rather than pretending it failed while funds
-        // are still held. A row that is already FAILED must stay FAILED.
+        // that still owns an active reservation PENDING and flag it, rather
+        // than pretending it failed while funds are still held. Terminal rows
+        // and rows without an active reservation are left unchanged.
         try {
             await Refund.updateOne(
                 {
                     _id: refundId,
-                    status: { $in: ["CREATED", "PENDING"] }
+                    status: { $in: ["CREATED", "PENDING"] },
+                    reservationActive: true
                 },
                 {
                     $set: {
