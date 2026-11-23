@@ -1117,142 +1117,177 @@ async function claimRefundKey(details: {
 async function finalizeRefund(refundId: string): Promise<RefundStatus> {
 
     let session: mongoose.ClientSession | undefined;
+    let finalized = false;
+    let statusAfterAttempt: RefundStatus | undefined;
 
     try {
         session = await mongoose.startSession();
-        session.startTransaction();
+        const txSession = session;
 
-        // 1. Claim the finalization. Only a reserved refund can be claimed,
-        //    and only once.
-        const refund = await Refund.findOneAndUpdate(
-            {
-                _id: refundId,
-                status: { $in: ["CREATED", "PENDING"] },
-                reservationActive: true
-            },
-            {
-                $set: {
-                    status: "PROCESSED",
-                    reservationActive: false,
-                    requiresReconciliation: false,
-                    finalizedAt: new Date()
-                }
-            },
-            { new: true, session }
-        );
+        await txSession.withTransaction(async () => {
+            finalized = false;
+            statusAfterAttempt = undefined;
 
-        if (!refund) {
-            // Already finalized, or the reservation is not active yet.
-            if (session.inTransaction()) {
-                await session.abortTransaction();
+            // 1. Claim the finalization. Only a reserved refund can be claimed,
+            //    and only once. Re-reading this row on every retry stops a
+            //    retry from debiting an already-finalized or released refund.
+            const refund = await Refund.findOneAndUpdate(
+                {
+                    _id: refundId,
+                    status: { $in: ["CREATED", "PENDING"] },
+                    reservationActive: true
+                },
+                {
+                    $set: {
+                        status: "PROCESSED",
+                        reservationActive: false,
+                        requiresReconciliation: false,
+                        finalizedAt: new Date()
+                    }
+                },
+                { new: true, session: txSession }
+            );
+
+            if (!refund) {
+                // Already finalized, released, or the reservation is not
+                // active yet.
+                const current = await Refund.findById(refundId)
+                    .session(txSession);
+
+                statusAfterAttempt = current?.status ?? "FAILED";
+                return;
             }
 
-            const current = await Refund.findById(refundId);
-            return current?.status ?? "FAILED";
-        }
+            // 2. Move the reserved wallet funds out of the wallet.
+            //    The $expr guard proves the reservation really exists, so this
+            //    can never overdraw the wallet or debit an unreserved refund.
+            const wallet = await Wallet.findOneAndUpdate(
+                {
+                    ownerId: refund.userId,
+                    $expr: {
+                        $and: [
+                            { $gte: [{ $ifNull: ["$reservedBalance", 0] }, refund.amount] },
+                            { $gte: ["$balance", refund.amount] }
+                        ]
+                    }
+                },
+                {
+                    $inc: {
+                        balance: -refund.amount,
+                        reservedBalance: -refund.amount
+                    }
+                },
+                { new: true, session: txSession }
+            );
 
-        // 2. Move the reserved wallet funds out of the wallet.
-        //    The $expr guard proves the reservation really exists, so this
-        //    can never overdraw the wallet or debit an unreserved refund.
-        const wallet = await Wallet.findOneAndUpdate(
-            {
-                ownerId: refund.userId,
-                $expr: {
-                    $and: [
-                        { $gte: [{ $ifNull: ["$reservedBalance", 0] }, refund.amount] },
-                        { $gte: ["$balance", refund.amount] }
-                    ]
-                }
-            },
-            {
-                $inc: {
-                    balance: -refund.amount,
-                    reservedBalance: -refund.amount
-                }
-            },
-            { new: true, session }
-        );
+            if (!wallet) {
+                throw new Error("Wallet reservation is missing during refund finalization.");
+            }
 
-        if (!wallet) {
-            throw new Error("Wallet reservation is missing during refund finalization.");
-        }
+            // 3. Move the reserved capacity into the completed refund total.
+            const payment = await Payment.findOneAndUpdate(
+                {
+                    _id: refund.paymentId,
+                    $expr: {
+                        $gte: [
+                            { $ifNull: ["$reservedRefundAmount", 0] },
+                            refund.amount
+                        ]
+                    }
+                },
+                {
+                    $inc: {
+                        reservedRefundAmount: -refund.amount,
+                        refundedAmount: refund.amount
+                    }
+                },
+                { new: true, session: txSession }
+            );
 
-        // 3. Move the reserved capacity into the completed refund total.
-        const payment = await Payment.findOneAndUpdate(
-            {
-                _id: refund.paymentId,
-                $expr: {
-                    $gte: [
-                        { $ifNull: ["$reservedRefundAmount", 0] },
-                        refund.amount
-                    ]
-                }
-            },
-            {
-                $inc: {
-                    reservedRefundAmount: -refund.amount,
-                    refundedAmount: refund.amount
-                }
-            },
-            { new: true, session }
-        );
+            if (!payment) {
+                throw new Error("Payment reservation is missing during refund finalization.");
+            }
 
-        if (!payment) {
-            throw new Error("Payment reservation is missing during refund finalization.");
-        }
+            // 4. Exactly one DEBIT transaction. Reusing the refund's idempotency
+            //    key means a retry cannot create a second one.
+            const transaction = new Transaction({
+                walletId: wallet._id,
+                type: "DEBIT",
+                amount: refund.amount,
+                currency: refund.currency,
+                status: "Success",
+                idempotencyKey: refund.idempotencyKey,
+                description: "Refund for Razorpay payment"
+            });
 
-        // 4. Exactly one DEBIT transaction. Reusing the refund's idempotency
-        //    key means a retry cannot create a second one.
-        const transaction = new Transaction({
-            walletId: wallet._id,
-            type: "DEBIT",
-            amount: refund.amount,
-            currency: refund.currency,
-            status: "Success",
-            idempotencyKey: refund.idempotencyKey,
-            description: "Refund for Razorpay payment"
+            await transaction.save({ session: txSession });
+
+            // 5. Exactly one DEBIT ledger entry.
+            const ledger = new Ledger({
+                walletId: wallet._id,
+                transactionId: transaction._id,
+                type: "DEBIT",
+                amount: refund.amount,
+                balanceBefore: wallet.balance + refund.amount,
+                balanceAfter: wallet.balance,
+                currency: refund.currency,
+                description: "Razorpay payment refund"
+            });
+
+            await ledger.save({ session: txSession });
+
+            finalized = true;
         });
 
-        await transaction.save({ session });
+        if (finalized) {
+            return "PROCESSED";
+        }
 
-        // 5. Exactly one DEBIT ledger entry.
-        const ledger = new Ledger({
-            walletId: wallet._id,
-            transactionId: transaction._id,
-            type: "DEBIT",
-            amount: refund.amount,
-            balanceBefore: wallet.balance + refund.amount,
-            balanceAfter: wallet.balance,
-            currency: refund.currency,
-            description: "Razorpay payment refund"
-        });
+        if (statusAfterAttempt) {
+            return statusAfterAttempt;
+        }
 
-        await ledger.save({ session });
-
-        await session.commitTransaction();
-
-        return "PROCESSED";
+        const current = await Refund.findById(refundId);
+        return current?.status ?? "FAILED";
 
     } catch (error) {
 
-        if (session?.inTransaction()) {
-            await session.abortTransaction();
+        const uncertainCommit = isUnknownTransactionCommitResult(error);
+
+        if (!uncertainCommit && session?.inTransaction()) {
+            try {
+                await session.abortTransaction();
+            } catch (abortError) {
+                console.error("Refund finalization abort failed:", {
+                    refundId,
+                    abortError
+                });
+            }
         }
 
-        console.error("Refund finalization failed:", { refundId, error });
+        console.error("Refund finalization failed:", {
+            refundId,
+            uncertainCommit,
+            error
+        });
 
-        // Razorpay has refunded the customer but our accounting did not
-        // complete. Keep the reservation and flag the row for reconciliation.
-        // Do NOT count it as completed.
+        // Razorpay has refunded the customer. Only a still-reserved,
+        // non-terminal row is eligible for recovery; terminal PROCESSED/FAILED
+        // rows must never be downgraded to PENDING.
         try {
             await Refund.updateOne(
-                { _id: refundId, status: { $ne: "PROCESSED" } },
+                {
+                    _id: refundId,
+                    status: { $in: ["CREATED", "PENDING"] },
+                    reservationActive: true
+                },
                 {
                     $set: {
                         status: "PENDING",
                         requiresReconciliation: true,
-                        failureReason:
-                            "Wallet accounting failed after the Razorpay refund."
+                        failureReason: uncertainCommit
+                            ? "Razorpay refund was processed but the wallet accounting commit outcome is unknown."
+                            : "Wallet accounting failed after the Razorpay refund."
                     }
                 }
             );
@@ -1264,7 +1299,14 @@ async function finalizeRefund(refundId: string): Promise<RefundStatus> {
             );
         }
 
-        const current = await Refund.findById(refundId);
+        const current = await Refund.findById(refundId).catch((readError) => {
+            console.error(
+                "CRITICAL: could not read refund after finalization failure.",
+                { refundId, readError }
+            );
+            return null;
+        });
+
         return current?.status ?? "PENDING";
 
     } finally {
