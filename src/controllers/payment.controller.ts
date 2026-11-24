@@ -922,6 +922,11 @@ export const handleWebhook = async (
 
                 if (typeof entity.id !== "string" || entity.id.length === 0) {
                     mismatches.push("id");
+                } else if (
+                    localRefund.razorpayRefundId &&
+                    entity.id !== localRefund.razorpayRefundId
+                ) {
+                    mismatches.push("id");
                 }
 
                 if (entity.payment_id !== localRefund.razorpayPaymentId) {
@@ -1048,7 +1053,25 @@ export const handleWebhook = async (
                 );
 
             const updated = await Refund.findById(localRefund._id);
-            const persistedStatus = updated?.status ?? finalStatus;
+
+            if (!updated) {
+                console.error(
+                    "Refund webhook could not find the refund record after helper processing.",
+                    {
+                        refundId: String(localRefund._id),
+                        event,
+                        helperResult: finalStatus
+                    }
+                );
+
+                res.status(503).json({
+                    message: "Refund webhook processing is unresolved; retry later.",
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            const persistedStatus = updated.status;
 
             if (
                 persistedStatus !== "PROCESSED" &&
