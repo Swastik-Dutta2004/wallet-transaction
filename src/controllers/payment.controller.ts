@@ -2600,16 +2600,78 @@ export const reconcileRefund = async (
             const persisted = await Refund.updateOne(
                 {
                     _id: refund._id,
-                    status: { $in: ["CREATED", "PENDING"] }
+                    status: { $in: ["CREATED", "PENDING"] },
+                    $or: [
+                        { razorpayRefundId: null },
+                        { razorpayRefundId: razorpayRefund.id }
+                    ]
                 },
                 { $set: { razorpayRefundId: razorpayRefund.id } }
             );
 
-            if (
-                persisted.matchedCount === 0 &&
-                await respondWithFinalStatusIfChanged()
-            ) {
-                return;
+            if (persisted.matchedCount === 0) {
+                const current = await Refund.findById(refund._id);
+
+                if (!current) {
+                    res.status(404).json({
+                        message: "Refund not found."
+                    });
+                    return;
+                }
+
+                if (
+                    current.status === "PROCESSED" ||
+                    current.status === "FAILED"
+                ) {
+                    res.status(200).json({
+                        message: "Refund is already final.",
+                        refund: serializeRefund(current)
+                    });
+                    return;
+                }
+
+                if (current.razorpayRefundId !== razorpayRefund.id) {
+                    const hasConflictingId =
+                        current.razorpayRefundId !== undefined &&
+                        current.razorpayRefundId !== null;
+
+                    const reconciliationFailureReason = hasConflictingId
+                        ? "Stored Razorpay refund ID conflicts with the reconciled refund."
+                        : "Razorpay refund ID could not be persisted safely.";
+
+                    console.error(
+                        hasConflictingId
+                            ? "Refund reconciliation detected a conflicting Razorpay refund ID."
+                            : "Refund reconciliation could not persist the Razorpay refund ID.",
+                        {
+                            refundId: String(refund._id),
+                            candidateRazorpayRefundId: razorpayRefund.id,
+                            persistedRazorpayRefundId:
+                                current.razorpayRefundId ?? null,
+                            status: current.status
+                        }
+                    );
+
+                    const flagged = await markReconciliationPending(
+                        reconciliationFailureReason
+                    );
+
+                    if (
+                        !flagged &&
+                        await respondWithFinalStatusIfChanged()
+                    ) {
+                        return;
+                    }
+
+                    const updated = await Refund.findById(refund._id);
+
+                    res.status(409).json({
+                        message: reconciliationFailureReason,
+                        refund: updated ? serializeRefund(updated) : undefined,
+                        requiresReconciliation: true
+                    });
+                    return;
+                }
             }
         }
 
