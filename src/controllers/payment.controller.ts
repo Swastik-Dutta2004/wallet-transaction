@@ -807,7 +807,11 @@ export const handleWebhook = async (
             const refundEntity =
                 req.body.payload?.refund?.entity;
 
-            if (!refundEntity || !refundEntity.id) {
+            if (
+                !refundEntity ||
+                typeof refundEntity.id !== "string" ||
+                refundEntity.id.length === 0
+            ) {
                 res.status(400).json({
                     message: "Refund data is missing."
                 });
@@ -819,18 +823,12 @@ export const handleWebhook = async (
             });
 
             // Fall back to our own receipt (the idempotency key) in case
-            // the refund id was never stored locally.
+            // the refund id was never stored locally. Do not attach the id
+            // until the webhook has been validated.
             if (!refund && refundEntity.receipt) {
                 refund = await Refund.findOne({
                     idempotencyKey: refundEntity.receipt
                 });
-
-                if (refund) {
-                    await Refund.updateOne(
-                        { _id: refund._id },
-                        { $set: { razorpayRefundId: refundEntity.id } }
-                    );
-                }
             }
 
             if (!refund) {
@@ -842,21 +840,259 @@ export const handleWebhook = async (
                 return;
             }
 
-            if (event === "refund.processed") {
-                await finalizeRefund(String(refund._id));
+            const localRefund = refund;
+
+            if (
+                localRefund.status === "PROCESSED" ||
+                localRefund.status === "FAILED"
+            ) {
                 res.status(200).json({
-                    message: "Refund processed webhook handled."
+                    message: "Refund is already final."
                 });
                 return;
             }
 
-            await releaseRefundReservation(
-                String(refund._id),
-                "Razorpay reported the refund as failed (webhook)."
-            );
+            const flagForReconciliation = async (
+                failureReason: string
+            ): Promise<void> => {
+                const current = await Refund.findById(localRefund._id);
+
+                if (
+                    !current ||
+                    current.status === "PROCESSED" ||
+                    current.status === "FAILED"
+                ) {
+                    return;
+                }
+
+                try {
+                    if (current.reservationActive) {
+                        const result = await Refund.updateOne(
+                            {
+                                _id: localRefund._id,
+                                status: { $in: ["CREATED", "PENDING"] },
+                                reservationActive: true
+                            },
+                            {
+                                $set: {
+                                    status: "PENDING",
+                                    requiresReconciliation: true,
+                                    failureReason
+                                }
+                            }
+                        );
+
+                        if (result.matchedCount > 0) {
+                            return;
+                        }
+                    }
+
+                    await Refund.updateOne(
+                        {
+                            _id: localRefund._id,
+                            status: { $in: ["CREATED", "PENDING"] },
+                            reservationActive: false
+                        },
+                        {
+                            $set: {
+                                requiresReconciliation: true,
+                                failureReason
+                            }
+                        }
+                    );
+                } catch (flagError) {
+                    console.error(
+                        "CRITICAL: could not flag refund for reconciliation.",
+                        {
+                            refundId: String(localRefund._id),
+                            flagError
+                        }
+                    );
+                }
+            };
+
+            const validateRefundEntity = (entity: {
+                id?: unknown;
+                payment_id?: unknown;
+                amount?: unknown;
+                currency?: unknown;
+                receipt?: unknown;
+            }): string[] => {
+                const mismatches: string[] = [];
+
+                if (typeof entity.id !== "string" || entity.id.length === 0) {
+                    mismatches.push("id");
+                }
+
+                if (entity.payment_id !== localRefund.razorpayPaymentId) {
+                    mismatches.push("payment_id");
+                }
+
+                if (entity.amount !== localRefund.amount) {
+                    mismatches.push("amount");
+                }
+
+                if (entity.currency !== localRefund.currency) {
+                    mismatches.push("currency");
+                }
+
+                if (
+                    entity.receipt !== undefined &&
+                    entity.receipt !== null &&
+                    entity.receipt !== localRefund.idempotencyKey
+                ) {
+                    mismatches.push("receipt");
+                }
+
+                return mismatches;
+            };
+
+            const mismatches = validateRefundEntity(refundEntity);
+
+            if (mismatches.length > 0) {
+                console.error(
+                    "Refund webhook identity/financial validation failed:",
+                    {
+                        refundId: String(localRefund._id),
+                        event,
+                        mismatches,
+                        incomingRazorpayRefundId: refundEntity.id,
+                        storedRazorpayRefundId:
+                            localRefund.razorpayRefundId ?? null,
+                        amountMatched: refundEntity.amount === localRefund.amount,
+                        currencyMatched:
+                            refundEntity.currency === localRefund.currency,
+                        receiptMatched:
+                            refundEntity.receipt === undefined ||
+                            refundEntity.receipt === null ||
+                            refundEntity.receipt ===
+                                localRefund.idempotencyKey
+                    }
+                );
+
+                await flagForReconciliation(
+                    "Razorpay refund webhook identity or financial fields did not match the local refund."
+                );
+
+                res.status(409).json({
+                    message: "Refund webhook data did not match the local refund.",
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            if (!localRefund.razorpayRefundId) {
+                const attached = await Refund.updateOne(
+                    {
+                        _id: localRefund._id,
+                        status: { $in: ["CREATED", "PENDING"] },
+                        $or: [
+                            { razorpayRefundId: null },
+                            { razorpayRefundId: refundEntity.id }
+                        ]
+                    },
+                    { $set: { razorpayRefundId: refundEntity.id } }
+                );
+
+                if (attached.matchedCount === 0) {
+                    const current = await Refund.findById(localRefund._id);
+
+                    if (!current) {
+                        res.status(404).json({
+                            message: "Refund not found."
+                        });
+                        return;
+                    }
+
+                    if (
+                        current.status === "PROCESSED" ||
+                        current.status === "FAILED"
+                    ) {
+                        res.status(200).json({
+                            message: "Refund is already final."
+                        });
+                        return;
+                    }
+
+                    if (current.razorpayRefundId !== refundEntity.id) {
+                        console.error(
+                            "Refund webhook Razorpay refund ID conflict:",
+                            {
+                                refundId: String(localRefund._id),
+                                incomingRazorpayRefundId: refundEntity.id,
+                                persistedRazorpayRefundId:
+                                    current.razorpayRefundId ?? null
+                            }
+                        );
+
+                        await flagForReconciliation(
+                            "Incoming Razorpay refund ID conflicts with the stored refund ID."
+                        );
+
+                        res.status(409).json({
+                            message: "Stored Razorpay refund ID conflicts with the webhook refund.",
+                            requiresReconciliation: true
+                        });
+                        return;
+                    }
+                }
+
+                localRefund.razorpayRefundId = refundEntity.id;
+            }
+
+            const finalStatus = event === "refund.processed"
+                ? await finalizeRefund(String(localRefund._id))
+                : await releaseRefundReservation(
+                    String(localRefund._id),
+                    "Razorpay reported the refund as failed (webhook)."
+                );
+
+            const updated = await Refund.findById(localRefund._id);
+            const persistedStatus = updated?.status ?? finalStatus;
+
+            if (
+                persistedStatus !== "PROCESSED" &&
+                persistedStatus !== "FAILED"
+            ) {
+                await flagForReconciliation(
+                    "Refund webhook processing did not reach a terminal local state."
+                );
+
+                console.error(
+                    "Refund webhook processing unresolved:",
+                    {
+                        refundId: String(localRefund._id),
+                        event,
+                        helperResult: finalStatus,
+                        persistedStatus,
+                        requiresReconciliation:
+                            updated?.requiresReconciliation ?? false
+                    }
+                );
+
+                res.status(503).json({
+                    message: "Refund webhook processing is unresolved; retry later.",
+                    refund: updated ? serializeRefund(updated) : undefined,
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            if (
+                (event === "refund.processed" &&
+                    persistedStatus === "PROCESSED") ||
+                (event === "refund.failed" && persistedStatus === "FAILED")
+            ) {
+                res.status(200).json({
+                    message: event === "refund.processed"
+                        ? "Refund processed webhook handled."
+                        : "Refund failed webhook handled."
+                });
+                return;
+            }
 
             res.status(200).json({
-                message: "Refund failed webhook handled."
+                message: "Refund is already final."
             });
             return;
         }
