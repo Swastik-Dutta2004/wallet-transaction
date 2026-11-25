@@ -1875,13 +1875,20 @@ export const getPaymentStatus = async (
         }
 
         // 4. Return payment status
+        const externalStatus =
+            paymentOrder.status === "PAID"
+                ? "SUCCESS"
+                : paymentOrder.status === "CREATED"
+                    ? "PENDING"
+                    : "FAILED";
+
         res.status(200).json({
             message: "Payment status fetched successfully.",
             payment: {
                 orderId: paymentOrder.razorpayOrderId,
                 amount: paymentOrder.amount,
                 currency: paymentOrder.currency,
-                status: paymentOrder.status,
+                status: externalStatus,
                 createdAt: paymentOrder.createdAt,
                 updatedAt: paymentOrder.updatedAt
             }
