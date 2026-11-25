@@ -12,6 +12,11 @@ import { AuthRequest } from "../middleware/auth.middleware"
 import PaymentOrder from "../models/payment-order.models"
 import Refund from "../models/refund.models"
 import type { IRefund, RefundStatus } from "../models/refund.models"
+import type { IPayment } from "../models/payment.models"
+import type { ITransaction } from "../models/transaction.models"
+import type { ILedger } from "../models/ledger.models"
+import type { IWallet } from "../models/wallet.models"
+import type { IPaymentOrder } from "../models/payment-order.models"
 import type { Refunds } from "razorpay/dist/types/refunds";
 
 const razorpay = new Razorpay({
@@ -439,6 +444,464 @@ export const verifyPayment = async (
 };
 
 
+// ---------------------------------------------------------------------------
+// payment.captured state verification
+//
+// A duplicate key only proves that a unique index was violated. It does not
+// prove that THIS webhook's complete financial state was committed. These
+// helpers re-read every related record so that a duplicate, a conflict, and an
+// incomplete operation are handled differently.
+// ---------------------------------------------------------------------------
+
+type PaymentCaptureIdentity = {
+    paymentOrderId: string;
+    userId: mongoose.Types.ObjectId;
+    razorpayPaymentId: string;
+    razorpayOrderId: string;
+    amount: number;
+    currency: string;
+    idempotencyKey: string;
+};
+
+type PaymentCaptureVerification =
+    | {
+        kind: "absent";
+        paymentOrder: IPaymentOrder;
+        details: Record<string, unknown>;
+    }
+    | { kind: "verified"; details: Record<string, unknown> }
+    | { kind: "conflict"; reason: string; details: Record<string, unknown> }
+    | {
+        kind: "incomplete";
+        reason: string;
+        details: Record<string, unknown>;
+        error?: unknown;
+    };
+
+type PaymentCaptureOutcome =
+    | { kind: "created" }
+    | { kind: "wallet_not_found" }
+    | { kind: "wallet_inactive" }
+    | {
+        kind: "already_processed";
+        verification: Extract<PaymentCaptureVerification, { kind: "verified" }>;
+    }
+    | {
+        kind: "state_conflict";
+        verification: Extract<PaymentCaptureVerification, { kind: "conflict" }>;
+    }
+    | {
+        kind: "state_incomplete";
+        verification: Extract<PaymentCaptureVerification, { kind: "incomplete" }>;
+    };
+
+function samePaymentObjectId(left: unknown, right: unknown): boolean {
+    return left != null && right != null && String(left) === String(right);
+}
+
+function paymentCaptureLogDetails(
+    identity: PaymentCaptureIdentity
+): Record<string, unknown> {
+    return {
+        paymentOrderId: identity.paymentOrderId,
+        userId: String(identity.userId),
+        razorpayOrderId: identity.razorpayOrderId,
+        razorpayPaymentId: identity.razorpayPaymentId,
+        amount: identity.amount,
+        currency: identity.currency,
+        idempotencyKey: identity.idempotencyKey
+    };
+}
+
+function summarizePayment(payment: IPayment): Record<string, unknown> {
+    return {
+        id: String(payment._id),
+        userId: String(payment.userId),
+        razorpayOrderId: payment.razorpayOrderId,
+        razorpayPaymentId: payment.razorpayPaymentId,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status
+    };
+}
+
+function summarizePaymentOrder(order: IPaymentOrder): Record<string, unknown> {
+    return {
+        id: String(order._id),
+        userId: String(order.userId),
+        razorpayOrderId: order.razorpayOrderId,
+        amount: order.amount,
+        currency: order.currency,
+        status: order.status,
+        idempotencyKey: order.idempotencyKey
+    };
+}
+
+function summarizeTransaction(transaction: ITransaction): Record<string, unknown> {
+    return {
+        id: String(transaction._id),
+        walletId: transaction.walletId ? String(transaction.walletId) : null,
+        type: transaction.type,
+        status: transaction.status,
+        amount: transaction.amount,
+        currency: transaction.currency,
+        idempotencyKey: transaction.idempotencyKey ?? null,
+        description: transaction.description ?? null
+    };
+}
+
+function summarizeLedger(ledger: ILedger): Record<string, unknown> {
+    return {
+        id: String(ledger._id),
+        walletId: String(ledger.walletId),
+        transactionId: String(ledger.transactionId),
+        type: ledger.type,
+        amount: ledger.amount,
+        balanceBefore: ledger.balanceBefore,
+        balanceAfter: ledger.balanceAfter,
+        currency: ledger.currency
+    };
+}
+
+function summarizeWallet(wallet: IWallet): Record<string, unknown> {
+    return {
+        id: String(wallet._id),
+        ownerId: String(wallet.ownerId),
+        currency: wallet.currency,
+        status: wallet.status
+    };
+}
+
+async function verifyPaymentCaptureState(
+    identity: PaymentCaptureIdentity,
+    session?: mongoose.ClientSession
+): Promise<PaymentCaptureVerification> {
+    const details = paymentCaptureLogDetails(identity);
+    const querySession = session ?? null;
+
+    try {
+        // Reads are intentionally sequential: parallel operations are not
+        // supported inside a MongoDB transaction.
+        const persistedPaymentOrder =
+            await PaymentOrder.findById(identity.paymentOrderId).session(querySession);
+
+        if (!persistedPaymentOrder) {
+            return {
+                kind: "incomplete",
+                reason: "PaymentOrder is missing.",
+                details
+            };
+        }
+
+        if (
+            persistedPaymentOrder.razorpayOrderId !== identity.razorpayOrderId ||
+            !samePaymentObjectId(persistedPaymentOrder.userId, identity.userId) ||
+            persistedPaymentOrder.amount !== identity.amount ||
+            persistedPaymentOrder.currency !== identity.currency ||
+            persistedPaymentOrder.idempotencyKey !== identity.idempotencyKey
+        ) {
+            return {
+                kind: "conflict",
+                reason: "PaymentOrder identity does not match the webhook.",
+                details: {
+                    ...details,
+                    persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
+                }
+            };
+        }
+
+        const paymentByPaymentId =
+            await Payment.findOne({ razorpayPaymentId: identity.razorpayPaymentId })
+                .session(querySession);
+
+        const paymentByOrderId =
+            await Payment.findOne({ razorpayOrderId: identity.razorpayOrderId })
+                .session(querySession);
+
+        if (
+            paymentByOrderId &&
+            (!paymentByPaymentId ||
+                !samePaymentObjectId(paymentByOrderId._id, paymentByPaymentId._id))
+        ) {
+            return {
+                kind: "conflict",
+                reason: "Razorpay order ID is already linked to a different payment.",
+                details: {
+                    ...details,
+                    paymentByPaymentId: paymentByPaymentId
+                        ? summarizePayment(paymentByPaymentId)
+                        : null,
+                    paymentByOrderId: summarizePayment(paymentByOrderId)
+                }
+            };
+        }
+
+        const transactionByKey =
+            await Transaction.findOne({ idempotencyKey: identity.idempotencyKey })
+                .session(querySession);
+
+        // No payment and no transaction: either this is genuinely new, or the
+        // order is already terminal/final without its financial records.
+        if (!paymentByPaymentId && !transactionByKey) {
+            if (persistedPaymentOrder.status === "PAID") {
+                return {
+                    kind: "incomplete",
+                    reason: "PaymentOrder is PAID but its payment and credit records are missing.",
+                    details: {
+                        ...details,
+                        persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
+                    }
+                };
+            }
+
+            if (persistedPaymentOrder.status === "FAILED") {
+                return {
+                    kind: "conflict",
+                    reason: "PaymentOrder is FAILED although a captured payment was received.",
+                    details: {
+                        ...details,
+                        persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
+                    }
+                };
+            }
+
+            return {
+                kind: "absent",
+                paymentOrder: persistedPaymentOrder,
+                details
+            };
+        }
+
+        if (!transactionByKey) {
+            return {
+                kind: "incomplete",
+                reason: "Payment exists but its wallet credit transaction is missing.",
+                details: {
+                    ...details,
+                    persistedPayment: paymentByPaymentId
+                        ? summarizePayment(paymentByPaymentId)
+                        : null
+                }
+            };
+        }
+
+        if (
+            transactionByKey.type !== "CREDIT" ||
+            transactionByKey.status !== "Success" ||
+            transactionByKey.amount !== identity.amount ||
+            transactionByKey.currency !== identity.currency
+        ) {
+            return {
+                kind: "conflict",
+                reason: "Transaction does not belong to this Razorpay payment credit.",
+                details: {
+                    ...details,
+                    persistedTransaction: summarizeTransaction(transactionByKey)
+                }
+            };
+        }
+
+        const wallet =
+            await Wallet.findOne({ ownerId: identity.userId }).session(querySession);
+
+        if (!wallet) {
+            return {
+                kind: "incomplete",
+                reason: "Wallet is missing for the payment owner.",
+                details: {
+                    ...details,
+                    persistedTransaction: summarizeTransaction(transactionByKey)
+                }
+            };
+        }
+
+        if (
+            !samePaymentObjectId(wallet.ownerId, identity.userId) ||
+            wallet.currency !== identity.currency ||
+            !samePaymentObjectId(transactionByKey.walletId, wallet._id)
+        ) {
+            return {
+                kind: "conflict",
+                reason: "Transaction wallet does not match the payment owner.",
+                details: {
+                    ...details,
+                    persistedTransaction: summarizeTransaction(transactionByKey),
+                    persistedWallet: summarizeWallet(wallet)
+                }
+            };
+        }
+
+        if (!paymentByPaymentId) {
+            return {
+                kind: "incomplete",
+                reason: "Transaction exists but its Payment document is missing.",
+                details: {
+                    ...details,
+                    persistedTransaction: summarizeTransaction(transactionByKey)
+                }
+            };
+        }
+
+        if (
+            paymentByPaymentId.razorpayOrderId !== identity.razorpayOrderId ||
+            !samePaymentObjectId(paymentByPaymentId.userId, identity.userId) ||
+            paymentByPaymentId.amount !== identity.amount ||
+            paymentByPaymentId.currency !== identity.currency ||
+            paymentByPaymentId.status !== "SUCCESS"
+        ) {
+            return {
+                kind: "conflict",
+                reason: "Payment identity does not match the webhook.",
+                details: {
+                    ...details,
+                    persistedPayment: summarizePayment(paymentByPaymentId)
+                }
+            };
+        }
+
+        const ledgers =
+            await Ledger.find({
+                transactionId: transactionByKey._id,
+                walletId: wallet._id,
+                type: "CREDIT"
+            })
+                .session(querySession)
+                .limit(2);
+
+        if (ledgers.length === 0) {
+            return {
+                kind: "incomplete",
+                reason: "Wallet credit ledger entry is missing.",
+                details: {
+                    ...details,
+                    persistedTransaction: summarizeTransaction(transactionByKey)
+                }
+            };
+        }
+
+        if (ledgers.length > 1) {
+            return {
+                kind: "conflict",
+                reason: "Multiple CREDIT ledger entries exist for the wallet credit transaction.",
+                details: {
+                    ...details,
+                    persistedTransaction: summarizeTransaction(transactionByKey),
+                    ledgerCount: ledgers.length
+                }
+            };
+        }
+
+        const ledger = ledgers[0];
+
+        const balancesAreValid =
+            Number.isInteger(ledger.balanceBefore) &&
+            Number.isInteger(ledger.balanceAfter) &&
+            ledger.balanceBefore >= 0 &&
+            ledger.balanceAfter >= 0;
+
+        if (
+            !samePaymentObjectId(ledger.transactionId, transactionByKey._id) ||
+            !samePaymentObjectId(ledger.walletId, wallet._id) ||
+            ledger.type !== "CREDIT" ||
+            ledger.amount !== identity.amount ||
+            ledger.currency !== identity.currency ||
+            !balancesAreValid ||
+            ledger.balanceAfter - ledger.balanceBefore !== identity.amount
+        ) {
+            return {
+                kind: "conflict",
+                reason: "Wallet credit ledger entry is inconsistent with the payment.",
+                details: {
+                    ...details,
+                    persistedTransaction: summarizeTransaction(transactionByKey),
+                    persistedLedger: summarizeLedger(ledger)
+                }
+            };
+        }
+
+        if (persistedPaymentOrder.status === "FAILED") {
+            return {
+                kind: "conflict",
+                reason: "PaymentOrder is FAILED although matching financial records exist.",
+                details: {
+                    ...details,
+                    persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
+                }
+            };
+        }
+
+        if (persistedPaymentOrder.status !== "PAID") {
+            return {
+                kind: "incomplete",
+                reason: "PaymentOrder is not marked PAID.",
+                details: {
+                    ...details,
+                    persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
+                }
+            };
+        }
+
+        return {
+            kind: "verified",
+            details: {
+                ...details,
+                persistedPayment: summarizePayment(paymentByPaymentId),
+                persistedTransaction: summarizeTransaction(transactionByKey),
+                persistedLedger: summarizeLedger(ledger),
+                persistedWallet: summarizeWallet(wallet),
+                persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
+            }
+        };
+    } catch (error) {
+        return {
+            kind: "incomplete",
+            reason: "Payment capture state could not be read and verified.",
+            details,
+            error
+        };
+    }
+}
+
+function respondToPaymentCaptureVerification(
+    res: Response,
+    verification: Exclude<PaymentCaptureVerification, { kind: "absent" }>,
+    context: string
+): void {
+    if (verification.kind === "verified") {
+        res.status(200).json({
+            message: "Payment already processed."
+        });
+        return;
+    }
+
+    const logPayload = {
+        context,
+        reason: verification.reason,
+        ...verification.details,
+        ...(verification.kind === "incomplete" && verification.error
+            ? { error: verification.error }
+            : {})
+    };
+
+    if (verification.kind === "conflict") {
+        console.error("Payment capture state conflict:", logPayload);
+
+        res.status(409).json({
+            message: "Payment state conflicts with the webhook.",
+            requiresReconciliation: true
+        });
+        return;
+    }
+
+    console.error("Payment capture state unresolved:", logPayload);
+
+    res.status(503).json({
+        message: "Payment processing is unresolved; retry later.",
+        requiresReconciliation: true
+    });
+}
+
+
 export const handleWebhook = async (
     req: Request,
     res: Response
@@ -571,19 +1034,26 @@ export const handleWebhook = async (
                 return;
             }
 
-            // 9. Check if this payment was already processed
+            // 9. Verify any already persisted state before attempting a new credit.
 
-            const existingPayment =
-                await Payment.findOne({
-                    razorpayPaymentId
-                });
+            const identity: PaymentCaptureIdentity = {
+                paymentOrderId: String(paymentOrder._id),
+                userId: paymentOrder.userId,
+                razorpayPaymentId,
+                razorpayOrderId,
+                amount: paymentOrder.amount,
+                currency: paymentOrder.currency,
+                idempotencyKey: paymentOrder.idempotencyKey
+            };
 
-            if (existingPayment) {
+            const existingState = await verifyPaymentCaptureState(identity);
 
-                res.status(200).json({
-                    message: "Payment already processed."
-                });
-
+            if (existingState.kind !== "absent") {
+                respondToPaymentCaptureVerification(
+                    res,
+                    existingState,
+                    "pre_transaction"
+                );
                 return;
             }
 
@@ -591,136 +1061,246 @@ export const handleWebhook = async (
             // START MONGODB TRANSACTION
             // =================================================
 
-            session = await mongoose.startSession();
+            let outcome: PaymentCaptureOutcome | undefined;
 
-            const txSession = session;
+            try {
+                session = await mongoose.startSession();
 
-            const outcome = await txSession.withTransaction(async () => {
-                // 10. Re-check inside transaction
-                // Protects against simultaneous webhook requests
+                const txSession = session;
 
-                const existingPaymentInTransaction =
-                    await Payment.findOne({
-                        razorpayPaymentId
-                    }).session(txSession);
+                outcome = await txSession.withTransaction(async () => {
+                    // 10. Re-check inside the transaction. This must verify the
+                    // complete financial state, not merely the presence of a
+                    // matching key.
 
-                if (existingPaymentInTransaction) {
-                    return { kind: "already_processed" as const };
+                    const existingStateInTransaction =
+                        await verifyPaymentCaptureState(identity, txSession);
+
+                    if (existingStateInTransaction.kind === "verified") {
+                        return {
+                            kind: "already_processed" as const,
+                            verification: existingStateInTransaction
+                        };
+                    }
+
+                    if (existingStateInTransaction.kind === "conflict") {
+                        return {
+                            kind: "state_conflict" as const,
+                            verification: existingStateInTransaction
+                        };
+                    }
+
+                    if (existingStateInTransaction.kind === "incomplete") {
+                        return {
+                            kind: "state_incomplete" as const,
+                            verification: existingStateInTransaction
+                        };
+                    }
+
+                    // 11. Find user's wallet
+
+                    const wallet = await Wallet.findOne({ ownerId: paymentOrder.userId }).session(txSession);
+
+                    if (!wallet) {
+                        return { kind: "wallet_not_found" as const };
+                    }
+
+                    // 12. Check wallet status
+
+                    if (wallet.status !== "active") {
+                        return { kind: "wallet_inactive" as const };
+                    }
+
+                    // 13. Conditionally transition the PaymentOrder read in this
+                    // transaction from CREATED to PAID. This is done before any
+                    // writes so a failed transition cannot commit partial state.
+
+                    const persistedPaymentOrder =
+                        existingStateInTransaction.paymentOrder;
+
+                    const paidTransition =
+                        await PaymentOrder.updateOne(
+                            {
+                                _id: persistedPaymentOrder._id,
+                                status: "CREATED",
+                                razorpayOrderId: persistedPaymentOrder.razorpayOrderId,
+                                userId: persistedPaymentOrder.userId,
+                                amount: persistedPaymentOrder.amount,
+                                currency: persistedPaymentOrder.currency,
+                                idempotencyKey: persistedPaymentOrder.idempotencyKey
+                            },
+                            { $set: { status: "PAID" } },
+                            { session: txSession }
+                        );
+
+                    if (paidTransition.matchedCount !== 1) {
+                        return {
+                            kind: "state_incomplete" as const,
+                            verification: {
+                                kind: "incomplete" as const,
+                                reason: "PaymentOrder could not be transitioned from CREATED to PAID.",
+                                details: {
+                                    ...paymentCaptureLogDetails(identity),
+                                    matchedCount: paidTransition.matchedCount,
+                                    persistedPaymentOrder:
+                                        summarizePaymentOrder(persistedPaymentOrder)
+                                }
+                            }
+                        };
+                    }
+
+                    // 14. Credit wallet and store post-update balances
+
+                    const updatedWallet = await Wallet.findOneAndUpdate(
+                        { _id: wallet._id, status: "active" },
+                        { $inc: { balance: paymentOrder.amount } },
+                        { new: true, runValidators: true, session: txSession }
+                    );
+
+                    if (!updatedWallet) {
+                        // The PAID transition is already written in this
+                        // transaction, so returning a normal outcome here would
+                        // commit it without the wallet credit. Throwing forces
+                        // the whole transaction to abort.
+                        throw new Error(
+                            "Wallet became unavailable after the PaymentOrder was marked PAID."
+                        );
+                    }
+
+                    // 15. Store balances for the ledger entry
+
+                    const balanceAfter = updatedWallet.balance;
+
+                    const balanceBefore = balanceAfter - paymentOrder.amount;
+
+                    // 16. Create Payment
+
+                    const payment = new Payment({
+                        userId: paymentOrder.userId,
+                        razorpayOrderId,
+                        razorpayPaymentId,
+                        // NOTE: the x-razorpay-signature header is a WEBHOOK
+                        // signature (HMAC of the raw body). It is not the Razorpay
+                        // Checkout signature, so it is deliberately NOT stored in
+                        // razorpaySignature. That field is left empty for payments
+                        // first seen through a webhook.
+                        amount: paymentOrder.amount,
+                        currency: paymentOrder.currency,
+                        status: "SUCCESS"
+                    });
+
+                    await payment.save({ session: txSession });
+
+                    // 17. Create Transaction
+
+                    const transaction = new Transaction({
+                        walletId: updatedWallet._id,
+                        type: "CREDIT",
+                        amount: paymentOrder.amount,
+                        currency: paymentOrder.currency,
+                        status: "Success",
+
+                        // IMPORTANT:
+                        // Reuse the idempotency key
+                        // from PaymentOrder
+
+                        idempotencyKey: paymentOrder.idempotencyKey,
+
+                        description: "Money added through Razorpay webhook"
+                    });
+
+                    await transaction.save({
+                        session: txSession
+                    });
+
+                    // 18. Create Ledger
+
+                    const ledger = new Ledger({
+                        walletId: updatedWallet._id,
+                        transactionId: transaction._id,
+                        type: "CREDIT",
+                        amount: paymentOrder.amount,
+                        balanceBefore,
+                        balanceAfter,
+                        currency: paymentOrder.currency,
+                        description:
+                            "Razorpay wallet recharge"
+                    });
+
+                    await ledger.save({
+                        session: txSession
+                    });
+
+                    return { kind: "created" as const };
+                });
+            } catch (error) {
+                const duplicateKey = isDuplicateKeyError(error);
+                const uncertainCommit = isUnknownTransactionCommitResult(error);
+
+                // Refund errors keep their existing handling; only this
+                // payment.captured path verifies before acknowledging.
+                if (!duplicateKey && !uncertainCommit) {
+                    throw error;
                 }
 
-                const existingTransaction =
-                    await Transaction.findOne({ idempotencyKey: paymentOrder.idempotencyKey }).session(txSession);
-
-                if (existingTransaction) {
-                    return { kind: "already_processed" as const };
+                if (!uncertainCommit && session?.inTransaction()) {
+                    try {
+                        await session.abortTransaction();
+                    } catch (abortError) {
+                        console.error("Payment capture abort failed:", {
+                            razorpayPaymentId,
+                            abortError
+                        });
+                    }
                 }
 
-                // 11. Find user's wallet
+                const verification = await verifyPaymentCaptureState(identity);
 
-                const wallet = await Wallet.findOne({ ownerId: paymentOrder.userId }).session(txSession);
+                if (verification.kind === "absent") {
+                    console.error("Payment capture outcome could not be verified:", {
+                        context: "error_recovery",
+                        razorpayPaymentId,
+                        razorpayOrderId,
+                        paymentOrderId: identity.paymentOrderId,
+                        idempotencyKey: identity.idempotencyKey,
+                        duplicateKey,
+                        uncertainCommit,
+                        error
+                    });
 
-                if (!wallet) {
-                    return { kind: "wallet_not_found" as const };
+                    res.status(503).json({
+                        message: "Payment processing is unresolved; retry later.",
+                        requiresReconciliation: true
+                    });
+                    return;
                 }
 
-                // 12. Check wallet status
-
-                if (wallet.status !== "active") {
-                    return { kind: "wallet_inactive" as const };
-                }
-
-                // 13. Credit wallet and store post-update balances
-
-                const updatedWallet = await Wallet.findOneAndUpdate(
-                    { _id: wallet._id, status: "active" },
-                    { $inc: { balance: paymentOrder.amount } },
-                    { new: true, runValidators: true, session: txSession }
+                respondToPaymentCaptureVerification(
+                    res,
+                    verification,
+                    "error_recovery"
                 );
+                return;
+            }
 
-                if (!updatedWallet) {
-                    return { kind: "wallet_inactive" as const };
-                }
-
-                // 14. Store balances for the ledger entry
-
-                const balanceAfter = updatedWallet.balance;
-
-                const balanceBefore = balanceAfter - paymentOrder.amount;
-
-                // 15. Create Payment
-
-                const payment = new Payment({
-                    userId: paymentOrder.userId,
-                    razorpayOrderId,
-                    razorpayPaymentId,
-                    // NOTE: the x-razorpay-signature header is a WEBHOOK
-                    // signature (HMAC of the raw body). It is not the Razorpay
-                    // Checkout signature, so it is deliberately NOT stored in
-                    // razorpaySignature. That field is left empty for payments
-                    // first seen through a webhook.
-                    amount: paymentOrder.amount,
-                    currency: paymentOrder.currency,
-                    status: "SUCCESS"
+            if (!outcome) {
+                res.status(503).json({
+                    message: "Payment processing is unresolved; retry later.",
+                    requiresReconciliation: true
                 });
+                return;
+            }
 
-                await payment.save({ session: txSession });
-
-                // 16. Create Transaction
-
-                const transaction = new Transaction({
-                    walletId: updatedWallet._id,
-                    type: "CREDIT",
-                    amount: paymentOrder.amount,
-                    currency: paymentOrder.currency,
-                    status: "Success",
-
-                    // IMPORTANT:
-                    // Reuse the idempotency key
-                    // from PaymentOrder
-
-                    idempotencyKey: paymentOrder.idempotencyKey,
-
-                    description: "Money added through Razorpay webhook"
-                });
-
-                await transaction.save({
-                    session: txSession
-                });
-
-                // 17. Create Ledger
-
-                const ledger = new Ledger({
-                    walletId: updatedWallet._id,
-                    transactionId: transaction._id,
-                    type: "CREDIT",
-                    amount: paymentOrder.amount,
-                    balanceBefore,
-                    balanceAfter,
-                    currency: paymentOrder.currency,
-                    description:
-                        "Razorpay wallet recharge"
-                });
-
-                await ledger.save({
-                    session: txSession
-                });
-
-                // 18. Mark PaymentOrder as PAID
-
-                paymentOrder.status = "PAID";
-                paymentOrder.markModified("status");
-
-                await paymentOrder.save({
-                    session: txSession
-                });
-
-                return { kind: "created" as const };
-            });
-
-            if (outcome.kind === "already_processed") {
-                res.status(200).json({
-                    message: "Payment already processed."
-                });
+            if (
+                outcome.kind === "already_processed" ||
+                outcome.kind === "state_conflict" ||
+                outcome.kind === "state_incomplete"
+            ) {
+                respondToPaymentCaptureVerification(
+                    res,
+                    outcome.verification,
+                    "in_transaction"
+                );
                 return;
             }
 
