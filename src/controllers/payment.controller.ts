@@ -2679,6 +2679,19 @@ export const createRefund = async (
                 return;
             }
 
+            if (
+                existing.status === "CREATED" &&
+                existing.reservationActive === false
+            ) {
+                res.status(503).json({
+                    message:
+                        "Refund processing is unresolved; reconciliation is required.",
+                    refund: serializeRefund(existing),
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
             const inProgress =
                 existing.status === "CREATED" || existing.status === "PENDING";
 
