@@ -908,6 +908,7 @@ export const handleWebhook = async (
 ): Promise<void> => {
 
     let session: mongoose.ClientSession | undefined
+    let paymentCaptureIdentity: PaymentCaptureIdentity | undefined
 
     try {
 
@@ -1036,7 +1037,7 @@ export const handleWebhook = async (
 
             // 9. Verify any already persisted state before attempting a new credit.
 
-            const identity: PaymentCaptureIdentity = {
+            paymentCaptureIdentity = {
                 paymentOrderId: String(paymentOrder._id),
                 userId: paymentOrder.userId,
                 razorpayPaymentId,
@@ -1045,6 +1046,8 @@ export const handleWebhook = async (
                 currency: paymentOrder.currency,
                 idempotencyKey: paymentOrder.idempotencyKey
             };
+
+            const identity = paymentCaptureIdentity;
 
             const existingState = await verifyPaymentCaptureState(identity);
 
@@ -1710,26 +1713,116 @@ export const handleWebhook = async (
 
     } catch (error) {
 
-        // Rollback if transaction was started
+        const event = req.body?.event;
 
-        if (session?.inTransaction()) {
-            await session.abortTransaction();
+        const duplicateKey = isDuplicateKeyError(error);
+
+        const uncertainCommit =
+            isUnknownTransactionCommitResult(error);
+
+        const transactionError =
+            uncertainCommit ||
+            hasErrorLabel(error, "TransientTransactionError");
+
+        const unresolvedError =
+            duplicateKey || transactionError;
+
+        // Do not abort an uncertain commit. The commit may already have
+        // succeeded, and aborting cannot undo it.
+        if (!uncertainCommit && session?.inTransaction()) {
+            try {
+                await session.abortTransaction();
+            } catch (abortError) {
+                console.error("Webhook abort failed:", {
+                    event,
+                    abortError
+                });
+            }
         }
 
-        // A duplicate delivery can lose the race against a unique index
-        // (Payment.razorpayPaymentId or Transaction.idempotencyKey). The
-        // credit already happened, so acknowledge the webhook instead of
-        // returning 500 and making Razorpay retry it.
-        if (isDuplicateKeyError(error)) {
-            res.status(200).json({
-                message: "Webhook already processed."
+        if (
+            unresolvedError &&
+            event === "payment.captured" &&
+            paymentCaptureIdentity
+        ) {
+            let verification: PaymentCaptureVerification;
+
+            try {
+                verification =
+                    await verifyPaymentCaptureState(paymentCaptureIdentity);
+            } catch (verificationError) {
+                console.error(
+                    "Payment capture verification threw in the outer handler:",
+                    {
+                        event,
+                        duplicateKey,
+                        uncertainCommit,
+                        error,
+                        verificationError
+                    }
+                );
+
+                res.status(503).json({
+                    message: "Payment processing is unresolved; retry later.",
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            if (verification.kind === "absent") {
+                console.error(
+                    "Payment capture outcome could not be verified by the outer handler:",
+                    {
+                        event,
+                        duplicateKey,
+                        uncertainCommit,
+                        error
+                    }
+                );
+
+                res.status(503).json({
+                    message: "Payment processing is unresolved; retry later.",
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            respondToPaymentCaptureVerification(
+                res,
+                verification,
+                "outer_catch"
+            );
+            return;
+        }
+
+        // Refund events keep their already-reviewed branch/helper behavior.
+        // An E11000 escaping to this handler is not proof of success, and the
+        // bare duplicate-key code does not establish a refund identity
+        // conflict, so the safe response is to request a retry.
+        if (unresolvedError) {
+            console.error(
+                "Razorpay webhook outcome is unresolved:",
+                {
+                    event,
+                    duplicateKey,
+                    uncertainCommit,
+                    error
+                }
+            );
+
+            res.status(503).json({
+                message: "Webhook processing is unresolved; retry later.",
+                requiresReconciliation: true
             });
             return;
         }
 
         console.error(
             "Razorpay webhook error:",
-            error
+            {
+                event,
+                error
+            }
         );
 
         res.status(500).json({
