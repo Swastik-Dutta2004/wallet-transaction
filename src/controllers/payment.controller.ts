@@ -1959,10 +1959,12 @@ function serializeRefund(refund: IRefund) {
 // Claims the idempotency key by inserting the refund row BEFORE Razorpay is
 // called. The unique index on `idempotencyKey` is what guarantees that only
 // one request can ever reach Razorpay for a given key. The loser of the race
-// gets E11000 and is answered with the existing row.
+// gets E11000 and is answered with the existing row, or asked to retry if that
+// row is not readable yet.
 type ClaimResult =
     | { kind: "created"; refund: IRefund }
-    | { kind: "existing"; refund: IRefund };
+    | { kind: "existing"; refund: IRefund }
+    | { kind: "unresolved" };
 
 class RefundReservationError extends Error {
     constructor(
@@ -2030,7 +2032,7 @@ async function claimRefundKey(details: {
             // The unique index rejected the insert but the row is not
             // readable yet (a concurrent insert is still committing).
             // Ask the caller to retry.
-            throw error;
+            return { kind: "unresolved" };
         }
 
         return { kind: "existing", refund: existing };
@@ -2651,6 +2653,14 @@ export const createRefund = async (
             idempotencyKey,
             reason
         });
+
+        if (claim.kind === "unresolved") {
+            res.status(503).json({
+                message: "Refund request is unresolved; retry later.",
+                requiresReconciliation: true
+            });
+            return;
+        }
 
         if (claim.kind === "existing") {
             const existing = claim.refund;
