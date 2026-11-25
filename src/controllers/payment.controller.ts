@@ -2862,7 +2862,8 @@ export const createRefund = async (
                         $set: {
                             status: "FAILED",
                             requiresReconciliation: false,
-                            failureReason
+                            failureReason,
+                            finalizedAt: new Date()
                         }
                     }
                 );
