@@ -18,11 +18,102 @@ import type { ILedger } from "../models/ledger.models"
 import type { IWallet } from "../models/wallet.models"
 import type { IPaymentOrder } from "../models/payment-order.models"
 import type { Refunds } from "razorpay/dist/types/refunds";
+import type { Orders } from "razorpay/dist/types/orders";
 
 const razorpay = new Razorpay({
     key_id: process.env.RAZORPAY_KEY_ID!,
     key_secret: process.env.RAZORPAY_KEY_SECRET!
 });
+
+const PENDING_ORDER_ID_PREFIX = "pending_order_";
+
+function pendingOrderId(idempotencyKey: string): string {
+    return `${PENDING_ORDER_ID_PREFIX}${idempotencyKey}`;
+}
+
+function isPendingOrderId(razorpayOrderId: string): boolean {
+    return razorpayOrderId.startsWith(PENDING_ORDER_ID_PREFIX);
+}
+
+type RazorpayOrderLookup =
+    | { kind: "found"; order: Orders.RazorpayOrder }
+    | { kind: "missing" }
+    | { kind: "conflict"; reason: string }
+    | { kind: "unresolved"; error: unknown };
+
+// Razorpay documents receipt as unique and supports lookup by receipt. A retry
+// can therefore recover an order created before its local ID update failed
+// without creating a second Razorpay order.
+async function lookupRazorpayOrderByReceipt(
+    receipt: string,
+    amount: number,
+    currency: string
+): Promise<RazorpayOrderLookup> {
+    try {
+        const response = await razorpay.orders.all({ receipt, count: 100 });
+        const orders = Array.isArray(response.items) ? response.items : [];
+        const matches = orders.filter((order) => order.receipt === receipt);
+
+        if (matches.length === 0) {
+            return { kind: "missing" };
+        }
+
+        if (matches.length > 1) {
+            return {
+                kind: "conflict",
+                reason: "Multiple Razorpay orders exist for this idempotency key."
+            };
+        }
+
+        const order = matches[0];
+
+        if (Number(order.amount) !== amount || order.currency !== currency) {
+            return {
+                kind: "conflict",
+                reason: "Razorpay order does not match the local request."
+            };
+        }
+
+        return { kind: "found", order };
+    } catch (error) {
+        return { kind: "unresolved", error };
+    }
+}
+
+async function persistRazorpayOrderId(
+    idempotencyKey: string,
+    razorpayOrderId: string
+): Promise<IPaymentOrder | null> {
+    try {
+        const updated = await PaymentOrder.findOneAndUpdate(
+            {
+                idempotencyKey,
+                razorpayOrderId: pendingOrderId(idempotencyKey),
+                status: "CREATED"
+            },
+            { $set: { razorpayOrderId } },
+            { new: true, runValidators: true }
+        );
+
+        if (updated) {
+            return updated;
+        }
+
+        return await PaymentOrder.findOne({
+            idempotencyKey,
+            razorpayOrderId
+        });
+    } catch (error) {
+        if (!isDuplicateKeyError(error)) {
+            throw error;
+        }
+
+        return await PaymentOrder.findOne({
+            idempotencyKey,
+            razorpayOrderId
+        });
+    }
+}
 
 export const createOrder = async (
     req: AuthRequest,
@@ -71,56 +162,232 @@ export const createOrder = async (
             return;
         }
 
-        // Check if this request was already processed.
-        // Scoped to the authenticated user so a shared or guessable key
-        // cannot surface another user's order details.
+        const key = idempotencyKey;
+        const receipt = `receipt_${key}`;
+
+        const sendCreatedOrder = (
+            order: Orders.RazorpayOrder,
+            message: string,
+            statusCode: number
+        ): void => {
+            res.status(statusCode).json({
+                message,
+                order: {
+                    id: order.id,
+                    amount: order.amount,
+                    currency: order.currency,
+                    status: order.status
+                }
+            });
+        };
+
+        const sendPersistedOrder = (
+            paymentOrder: IPaymentOrder,
+            message: string
+        ): void => {
+            res.status(200).json({
+                message,
+                order: {
+                    id: paymentOrder.razorpayOrderId,
+                    amount: paymentOrder.amount,
+                    currency: paymentOrder.currency,
+                    status: paymentOrder.status
+                }
+            });
+        };
+
+        const sendOrderPersistenceFailure = (
+            orderId: string,
+            error?: unknown
+        ): void => {
+            console.error("Razorpay order could not be persisted:", {
+                idempotencyKey: key,
+                receipt,
+                razorpayOrderId: orderId,
+                error
+            });
+
+            res.status(503).json({
+                message: "Razorpay order was created but could not be persisted; retry with the same Idempotency-Key.",
+                requiresReconciliation: true
+            });
+        };
+
+        const persistAndRespond = async (
+            order: Orders.RazorpayOrder,
+            message: string,
+            statusCode: number,
+            replay: boolean
+        ): Promise<void> => {
+            try {
+                const persisted = await persistRazorpayOrderId(key, order.id);
+
+                if (!persisted) {
+                    sendOrderPersistenceFailure(order.id);
+                    return;
+                }
+
+                if (replay) {
+                    sendPersistedOrder(persisted, message);
+                } else {
+                    sendCreatedOrder(order, message, statusCode);
+                }
+            } catch (error) {
+                sendOrderPersistenceFailure(order.id, error);
+            }
+        };
+
+        const createRazorpayOrder = async (replay: boolean): Promise<void> => {
+            const message = replay
+                ? "Request already processed."
+                : "Razorpay order created successfully.";
+            const statusCode = replay ? 200 : 201;
+
+            try {
+                const order = await razorpay.orders.create({
+                    amount: amountInPaise,
+                    currency: "INR",
+                    receipt
+                });
+
+                await persistAndRespond(order, message, statusCode, replay);
+            } catch (error) {
+                const recovery = await lookupRazorpayOrderByReceipt(
+                    receipt,
+                    amountInPaise,
+                    "INR"
+                );
+
+                if (recovery.kind === "found") {
+                    await persistAndRespond(
+                        recovery.order,
+                        message,
+                        statusCode,
+                        replay
+                    );
+                    return;
+                }
+
+                if (recovery.kind === "conflict") {
+                    res.status(409).json({
+                        message: recovery.reason,
+                        requiresReconciliation: true
+                    });
+                    return;
+                }
+
+                console.error("Razorpay order creation outcome could not be verified:", {
+                    idempotencyKey: key,
+                    receipt,
+                    error,
+                    recovery
+                });
+
+                res.status(503).json({
+                    message: "Razorpay order creation is unresolved; retry with the same Idempotency-Key.",
+                    requiresReconciliation: true
+                });
+            }
+        };
+
+        const handleExistingPaymentOrder = async (
+            existingPaymentOrder: IPaymentOrder
+        ): Promise<void> => {
+            if (
+                existingPaymentOrder.userId.toString() !== userId ||
+                existingPaymentOrder.amount !== amountInPaise ||
+                existingPaymentOrder.currency !== "INR"
+            ) {
+                res.status(409).json({
+                    message: "Idempotency-Key has already been used with different request parameters."
+                });
+                return;
+            }
+
+            if (!isPendingOrderId(existingPaymentOrder.razorpayOrderId)) {
+                sendPersistedOrder(existingPaymentOrder, "Request already processed.");
+                return;
+            }
+
+            const recovery = await lookupRazorpayOrderByReceipt(
+                receipt,
+                amountInPaise,
+                "INR"
+            );
+
+            if (recovery.kind === "found") {
+                await persistAndRespond(
+                    recovery.order,
+                    "Request already processed.",
+                    200,
+                    true
+                );
+                return;
+            }
+
+            if (recovery.kind === "conflict") {
+                res.status(409).json({
+                    message: recovery.reason,
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            if (recovery.kind === "unresolved") {
+                console.error("Razorpay order recovery failed:", {
+                    idempotencyKey: key,
+                    receipt,
+                    error: recovery.error
+                });
+
+                res.status(503).json({
+                    message: "Order creation is unresolved; retry with the same Idempotency-Key.",
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            await createRazorpayOrder(true);
+        };
+
         const existingPaymentOrder = await PaymentOrder.findOne({
-            idempotencyKey,
-            userId
+            idempotencyKey: key
         });
 
         if (existingPaymentOrder) {
-            res.status(200).json({
-                message: "Request already processed.",
-                order: {
-                    id: existingPaymentOrder.razorpayOrderId,
-                    amount: existingPaymentOrder.amount,
-                    currency: existingPaymentOrder.currency,
-                    status: existingPaymentOrder.status
-                }
-            });
+            await handleExistingPaymentOrder(existingPaymentOrder);
             return;
         }
 
-        // Create order on Razorpay
-        const order = await razorpay.orders.create({
-            amount: amountInPaise,
-            currency: "INR",
-            receipt: `receipt_${idempotencyKey}`
-        });
-
-        // Save Razorpay order in our database
         const paymentOrder = new PaymentOrder({
             userId,
-            razorpayOrderId: order.id,
+            // Claim the required unique field locally before calling Razorpay.
+            // It is replaced with the real order ID only after creation succeeds.
+            razorpayOrderId: pendingOrderId(key),
             amount: amountInPaise,
             currency: "INR",
-            idempotencyKey,
+            idempotencyKey: key,
             status: "CREATED"
         });
 
-        await paymentOrder.save();
+        try {
+            await paymentOrder.save();
+        } catch (error) {
+            if (isDuplicateKeyError(error)) {
+                const existing = await PaymentOrder.findOne({
+                    idempotencyKey: key
+                });
 
-        // Send order details to frontend
-        res.status(201).json({
-            message: "Razorpay order created successfully.",
-            order: {
-                id: order.id,
-                amount: order.amount,
-                currency: order.currency,
-                status: order.status
+                if (existing) {
+                    await handleExistingPaymentOrder(existing);
+                    return;
+                }
             }
-        });
+
+            throw error;
+        }
+
+        await createRazorpayOrder(false);
 
     } catch (error) {
         console.error("Create Razorpay order error:", error);
@@ -138,6 +405,7 @@ export const verifyPayment = async (
 ): Promise<void> => {
 
     let session: mongoose.ClientSession | undefined
+    let paymentCaptureIdentity: PaymentCaptureIdentity | undefined
 
     try {
 
@@ -234,17 +502,30 @@ export const verifyPayment = async (
             return;
         }
 
-        // 6. Check if already processed
+        // 6. Verify any already persisted financial state before attempting
+        // a new credit. Presence of a Payment or Transaction key alone is not
+        // enough to prove that this payment was fully credited.
 
-        const existingPayment = await Payment.findOne({
-            razorpayPaymentId: razorpay_payment_id
-        });
+        const identity: PaymentCaptureIdentity = {
+            paymentOrderId: String(paymentOrder._id),
+            userId: paymentOrder.userId,
+            razorpayPaymentId: razorpay_payment_id,
+            razorpayOrderId: razorpay_order_id,
+            amount: paymentOrder.amount,
+            currency: paymentOrder.currency,
+            idempotencyKey: paymentOrder.idempotencyKey
+        };
 
-        if (existingPayment) {
-            res.status(200).json({
-                message: "Payment has already been processed.",
-                paymentId: existingPayment.razorpayPaymentId
-            });
+        paymentCaptureIdentity = identity;
+
+        const existingState = await verifyPaymentCaptureState(identity);
+
+        if (existingState.kind !== "absent") {
+            respondToPaymentCaptureVerification(
+                res,
+                existingState,
+                "verify_payment_pre_transaction"
+            );
             return;
         }
 
@@ -270,25 +551,27 @@ export const verifyPayment = async (
         const txSession = session;
 
         const outcome = await txSession.withTransaction(async () => {
-            const existingPaymentInTransaction = await Payment.findOne({
-                razorpayPaymentId: razorpay_payment_id
-            }).session(txSession);
+            const existingStateInTransaction =
+                await verifyPaymentCaptureState(identity, txSession);
 
-            if (existingPaymentInTransaction) {
+            if (existingStateInTransaction.kind === "verified") {
                 return {
                     kind: "already_processed" as const,
-                    paymentId: existingPaymentInTransaction.razorpayPaymentId
+                    verification: existingStateInTransaction
                 };
             }
 
-            const existingTransactionInTransaction = await Transaction.findOne({
-                idempotencyKey: paymentOrder.idempotencyKey
-            }).session(txSession);
-
-            if (existingTransactionInTransaction) {
+            if (existingStateInTransaction.kind === "conflict") {
                 return {
-                    kind: "already_processed" as const,
-                    paymentId: razorpay_payment_id
+                    kind: "state_conflict" as const,
+                    verification: existingStateInTransaction
+                };
+            }
+
+            if (existingStateInTransaction.kind === "incomplete") {
+                return {
+                    kind: "state_incomplete" as const,
+                    verification: existingStateInTransaction
                 };
             }
 
@@ -383,6 +666,19 @@ export const verifyPayment = async (
             };
         });
 
+        if (
+            outcome.kind === "already_processed" ||
+            outcome.kind === "state_conflict" ||
+            outcome.kind === "state_incomplete"
+        ) {
+            respondToPaymentCaptureVerification(
+                res,
+                outcome.verification,
+                "verify_payment_in_transaction"
+            );
+            return;
+        }
+
         if (outcome.kind === "wallet_not_found") {
             res.status(404).json({
                 message: "Wallet not found."
@@ -393,14 +689,6 @@ export const verifyPayment = async (
         if (outcome.kind === "wallet_inactive") {
             res.status(400).json({
                 message: "Wallet is not active."
-            });
-            return;
-        }
-
-        if (outcome.kind === "already_processed") {
-            res.status(200).json({
-                message: "Payment has already been processed.",
-                paymentId: outcome.paymentId
             });
             return;
         }
@@ -425,10 +713,29 @@ export const verifyPayment = async (
             await session.abortTransaction();
         }
 
-        if (isDuplicateKeyError(error)) {
-            res.status(200).json({
-                message: "Payment has already been processed."
-            });
+        if (paymentCaptureIdentity && isDuplicateKeyError(error)) {
+            const verification =
+                await verifyPaymentCaptureState(paymentCaptureIdentity);
+
+            if (verification.kind === "absent") {
+                console.error("Payment verification outcome could not be verified:", {
+                    context: "error_recovery",
+                    ...paymentCaptureLogDetails(paymentCaptureIdentity),
+                    error
+                });
+
+                res.status(503).json({
+                    message: "Payment processing is unresolved; retry later.",
+                    requiresReconciliation: true
+                });
+                return;
+            }
+
+            respondToPaymentCaptureVerification(
+                res,
+                verification,
+                "verify_payment_error_recovery"
+            );
             return;
         }
 
