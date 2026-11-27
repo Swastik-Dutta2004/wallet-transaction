@@ -15,6 +15,14 @@ export interface IPaymentOrder extends Document {
 
     status: "CREATED" | "PAID" | "FAILED";
 
+    // null on a new creation claim, set only immediately before the first
+    // Razorpay call. Absent means a pre-recovery-version record.
+    creationDispatchedAt?: Date | null;
+
+    // Unique token for the current creation attempt. Recovery clears it so a
+    // stale request cannot advance an already-reclaimed order.
+    creationClaimToken?: string | null;
+
     createdAt: Date;
     updatedAt: Date;
 }
@@ -55,6 +63,16 @@ const paymentOrderSchema = new Schema<IPaymentOrder>(
             type: String,
             enum: ["CREATED", "PAID", "FAILED"],
             default: "CREATED"
+        },
+
+        creationDispatchedAt: {
+            type: Date,
+            default: null
+        },
+
+        creationClaimToken: {
+            type: String,
+            default: null
         }
     },
     {

@@ -26,13 +26,325 @@ const razorpay = new Razorpay({
 });
 
 const PENDING_ORDER_ID_PREFIX = "pending_order_";
+const CREATING_ORDER_ID_PREFIX = "creating_order_";
+const CALLING_ORDER_ID_PREFIX = "calling_order_";
+const DEFAULT_ORDER_CREATION_LEASE_MS = 5 * 60 * 1000;
 
 function pendingOrderId(idempotencyKey: string): string {
     return `${PENDING_ORDER_ID_PREFIX}${idempotencyKey}`;
 }
 
+function newOrderCreationClaimToken(): string {
+    return crypto.randomBytes(16).toString("hex");
+}
+
+// The token is part of the marker as well as a separate indexed-by-filter
+// field, so every generation has a distinct marker and no transition can be
+// replayed against a recovered claim.
+function creatingOrderId(idempotencyKey: string, claimToken: string): string {
+    return `${CREATING_ORDER_ID_PREFIX}${idempotencyKey}:${claimToken}`;
+}
+
+function callingOrderId(idempotencyKey: string, claimToken: string): string {
+    return `${CALLING_ORDER_ID_PREFIX}${idempotencyKey}:${claimToken}`;
+}
+
 function isPendingOrderId(razorpayOrderId: string): boolean {
     return razorpayOrderId.startsWith(PENDING_ORDER_ID_PREFIX);
+}
+
+function isCreatingOrderId(razorpayOrderId: string): boolean {
+    return razorpayOrderId.startsWith(CREATING_ORDER_ID_PREFIX);
+}
+
+function isCallingOrderId(razorpayOrderId: string): boolean {
+    return razorpayOrderId.startsWith(CALLING_ORDER_ID_PREFIX);
+}
+
+function claimTokenFromMarker(razorpayOrderId: string): string | null {
+    if (!isCreatingOrderId(razorpayOrderId) && !isCallingOrderId(razorpayOrderId)) {
+        return null;
+    }
+
+    const separator = razorpayOrderId.lastIndexOf(":");
+    if (separator < 0 || separator === razorpayOrderId.length - 1) {
+        return null;
+    }
+
+    return razorpayOrderId.slice(separator + 1);
+}
+
+function orderCreationLeaseMs(): number {
+    const configured = Number(process.env.ORDER_CREATION_LEASE_MS);
+    return Number.isFinite(configured) && configured > 0
+        ? configured
+        : DEFAULT_ORDER_CREATION_LEASE_MS;
+}
+
+function hasOrderCreationClaimExpired(updatedAt?: Date): boolean {
+    if (!updatedAt) {
+        return false;
+    }
+
+    return Date.now() - updatedAt.getTime() >= orderCreationLeaseMs();
+}
+
+type OrderCreationClaimDetails = {
+    paymentOrderId: string;
+    idempotencyKey: string;
+    userId: string;
+    amount: number;
+    currency: string;
+};
+
+// Every marker transition is conditional on the expected PaymentOrder,
+// request details, exact marker and exact claim token. A stale request cannot
+// move a claim that another request has recovered.
+async function transitionOrderCreationMarker(
+    details: OrderCreationClaimDetails,
+    expectedMarker: string,
+    nextMarker: string,
+    extraFilter: Record<string, unknown> = {},
+    extraSet: Record<string, unknown> = {}
+): Promise<boolean> {
+    const result = await PaymentOrder.updateOne(
+        {
+            _id: details.paymentOrderId,
+            idempotencyKey: details.idempotencyKey,
+            razorpayOrderId: expectedMarker,
+            userId: details.userId,
+            amount: details.amount,
+            currency: details.currency,
+            status: "CREATED",
+            ...extraFilter
+        },
+        {
+            $set: {
+                razorpayOrderId: nextMarker,
+                ...extraSet
+            }
+        }
+    );
+
+    return result.matchedCount === 1;
+}
+
+// pending -> creating. Only this claim winner may progress toward Razorpay.
+// A fresh token makes this claim generation distinct from any previous one.
+async function claimRazorpayOrderCreation(
+    details: OrderCreationClaimDetails,
+    claimToken: string
+): Promise<boolean> {
+    return await transitionOrderCreationMarker(
+        details,
+        pendingOrderId(details.idempotencyKey),
+        creatingOrderId(details.idempotencyKey, claimToken),
+        { creationClaimToken: null },
+        {
+            creationDispatchedAt: null,
+            creationClaimToken: claimToken
+        }
+    );
+}
+
+// creating -> calling is a write-ahead marker written immediately before the
+// first Razorpay network call. It is valid only for the exact current token.
+async function markRazorpayOrderCreationDispatched(
+    details: OrderCreationClaimDetails,
+    claimToken: string
+): Promise<boolean> {
+    return await transitionOrderCreationMarker(
+        details,
+        creatingOrderId(details.idempotencyKey, claimToken),
+        callingOrderId(details.idempotencyKey, claimToken),
+        {
+            creationDispatchedAt: null,
+            creationClaimToken: claimToken
+        },
+        {
+            creationDispatchedAt: new Date(),
+            creationClaimToken: claimToken
+        }
+    );
+}
+
+// A `calling_order_` marker is never lease-released. It is released only when
+// Razorpay definitively rejected the request, and only for the token that
+// actually dispatched that request.
+async function releaseRazorpayOrderCreationClaim(
+    details: OrderCreationClaimDetails,
+    claimToken: string
+): Promise<boolean> {
+    return await transitionOrderCreationMarker(
+        details,
+        callingOrderId(details.idempotencyKey, claimToken),
+        pendingOrderId(details.idempotencyKey),
+        {
+            creationDispatchedAt: { $ne: null },
+            creationClaimToken: claimToken
+        },
+        {
+            creationDispatchedAt: null,
+            creationClaimToken: null
+        }
+    );
+}
+
+// An abandoned claim can be recovered only when its exact token is still
+// present, it was never dispatched, and its lease expired. Recovery clears the
+// token, invalidating the old claim before the next claim is created.
+async function recoverAbandonedRazorpayOrderCreationClaim(
+    details: OrderCreationClaimDetails,
+    claimToken: string
+): Promise<boolean> {
+    const cutoff = new Date(Date.now() - orderCreationLeaseMs());
+
+    return await transitionOrderCreationMarker(
+        details,
+        creatingOrderId(details.idempotencyKey, claimToken),
+        pendingOrderId(details.idempotencyKey),
+        {
+            creationDispatchedAt: null,
+            creationClaimToken: claimToken,
+            updatedAt: { $lte: cutoff }
+        },
+        {
+            creationDispatchedAt: null,
+            creationClaimToken: null
+        }
+    );
+}
+
+function getRazorpayOrderErrorDetails(error: unknown): {
+    statusCode?: number;
+    code?: string;
+    description?: string;
+    reason?: string;
+    field?: string;
+} {
+    if (!error || typeof error !== "object") {
+        return {};
+    }
+
+    const details = error as {
+        statusCode?: unknown;
+        error?: {
+            code?: unknown;
+            description?: unknown;
+            reason?: unknown;
+            field?: unknown;
+        };
+    };
+
+    const statusCode = Number(details.statusCode);
+
+    return {
+        statusCode: Number.isFinite(statusCode) ? statusCode : undefined,
+        code:
+            typeof details.error?.code === "string"
+                ? details.error.code.toUpperCase()
+                : undefined,
+        description:
+            typeof details.error?.description === "string"
+                ? details.error.description
+                : undefined,
+        reason:
+            typeof details.error?.reason === "string"
+                ? details.error.reason.toLowerCase()
+                : undefined,
+        field:
+            typeof details.error?.field === "string"
+                ? details.error.field.toLowerCase()
+                : undefined
+    };
+}
+
+// Fail closed: only a small allowlist of documented order-create rejections
+// proves that no order was created. A generic 400/BAD_REQUEST_ERROR with an
+// unknown or missing description is ambiguous and must go through receipt
+// reconciliation while retaining the calling marker.
+const DEFINITIVE_ORDER_REJECTION_DESCRIPTIONS = new Set([
+    "authentication failed.",
+    "the amount must be at least inr 1.00",
+    "the field name is required.",
+    "amount: must be no less than 0.",
+    "the amount must be an integer.",
+    "amount exceeds maximum amount allowed.",
+    "currency: validation_failure: bad_request_invalid_currency.",
+    "receipt: the length must be no more than 40.",
+    "the receipt: validation_failure: bad_request_encoding_validation_failed.",
+    "first_payment_min_amount should be greater than or equal to 0.",
+    "eof.",
+    "bank code provided is invalid.",
+    "the requested bank is not enabled for the merchant.",
+    "bank code should be provided in input if account number is sent.",
+    "account number is mandatory for this merchant."
+]);
+
+const DEFINITIVE_ORDER_VALIDATION_FIELDS = new Set([
+    "amount",
+    "currency",
+    "receipt",
+    "first_payment_min_amount",
+    "bank",
+    "account_number"
+]);
+
+function isDefinitiveRazorpayOrderRejection(error: unknown): boolean {
+    const { statusCode, code, description, reason, field } =
+        getRazorpayOrderErrorDetails(error);
+
+    if (statusCode === undefined || statusCode < 400 || statusCode >= 500) {
+        return false;
+    }
+
+    if (code === "UNAUTHORIZED") {
+        return true;
+    }
+
+    if (statusCode !== 400 || code !== "BAD_REQUEST_ERROR") {
+        return false;
+    }
+
+    const normalizedDescription = description?.trim().toLowerCase();
+    if (!normalizedDescription) {
+        return false;
+    }
+
+    // Extra guard for messages that can hide an already-created order. The
+    // allowlists above are the primary safety mechanism, not these phrases.
+    const ambiguousPhrases = [
+        "duplicate",
+        "already",
+        "idempoten",
+        "in progress",
+        "processing",
+        "concurrent",
+        "exists",
+        "receipt should be unique",
+        "receipt must be unique",
+        "unique receipt"
+    ];
+
+    if (
+        ambiguousPhrases.some((phrase) =>
+            normalizedDescription.includes(phrase)
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        DEFINITIVE_ORDER_REJECTION_DESCRIPTIONS.has(normalizedDescription)
+    ) {
+        return true;
+    }
+
+    return (
+        reason === "input_validation_failed" &&
+        field !== undefined &&
+        DEFINITIVE_ORDER_VALIDATION_FIELDS.has(field)
+    );
 }
 
 type RazorpayOrderLookup =
@@ -80,18 +392,49 @@ async function lookupRazorpayOrderByReceipt(
     }
 }
 
-async function persistRazorpayOrderId(
-    idempotencyKey: string,
-    razorpayOrderId: string
-): Promise<IPaymentOrder | null> {
+// Conditional on the exact expected marker; an already-persisted Razorpay
+// order ID is never overwritten. The read-only fallback only confirms that
+// another request persisted the same external order.
+async function persistRazorpayOrderId(details: {
+    paymentOrderId: string;
+    idempotencyKey: string;
+    expectedMarker: string;
+    expectedClaimToken?: string | null;
+    razorpayOrderId: string;
+    userId: string;
+    amount: number;
+    currency: string;
+}): Promise<IPaymentOrder | null> {
+    const expectedClaimToken = details.expectedClaimToken ?? null;
+    const persistedOrderFilter = {
+        _id: details.paymentOrderId,
+        idempotencyKey: details.idempotencyKey,
+        razorpayOrderId: details.razorpayOrderId,
+        userId: details.userId,
+        amount: details.amount,
+        currency: details.currency,
+        creationClaimToken: null
+    };
+
     try {
         const updated = await PaymentOrder.findOneAndUpdate(
             {
-                idempotencyKey,
-                razorpayOrderId: pendingOrderId(idempotencyKey),
-                status: "CREATED"
+                _id: details.paymentOrderId,
+                idempotencyKey: details.idempotencyKey,
+                razorpayOrderId: details.expectedMarker,
+                userId: details.userId,
+                amount: details.amount,
+                currency: details.currency,
+                status: "CREATED",
+                creationClaimToken: expectedClaimToken
             },
-            { $set: { razorpayOrderId } },
+            {
+                $set: {
+                    razorpayOrderId: details.razorpayOrderId,
+                    creationDispatchedAt: null,
+                    creationClaimToken: null
+                }
+            },
             { new: true, runValidators: true }
         );
 
@@ -99,19 +442,13 @@ async function persistRazorpayOrderId(
             return updated;
         }
 
-        return await PaymentOrder.findOne({
-            idempotencyKey,
-            razorpayOrderId
-        });
+        return await PaymentOrder.findOne(persistedOrderFilter);
     } catch (error) {
         if (!isDuplicateKeyError(error)) {
             throw error;
         }
 
-        return await PaymentOrder.findOne({
-            idempotencyKey,
-            razorpayOrderId
-        });
+        return await PaymentOrder.findOne(persistedOrderFilter);
     }
 }
 
@@ -165,6 +502,14 @@ export const createOrder = async (
         const key = idempotencyKey;
         const receipt = `receipt_${key}`;
 
+        const claimDetails = (paymentOrderId: string) => ({
+            paymentOrderId,
+            idempotencyKey: key,
+            userId,
+            amount: amountInPaise,
+            currency: "INR"
+        });
+
         const sendCreatedOrder = (
             order: Orders.RazorpayOrder,
             message: string,
@@ -213,16 +558,51 @@ export const createOrder = async (
             });
         };
 
+        const sendCreationInProgress = (): void => {
+            res.status(409).json({
+                message: "Order creation is already in progress; retry with the same Idempotency-Key."
+            });
+        };
+
+        const sendUnresolvedCreation = (message: string): void => {
+            res.status(503).json({
+                message,
+                requiresReconciliation: true
+            });
+        };
+
         const persistAndRespond = async (
             order: Orders.RazorpayOrder,
+            paymentOrderId: string,
+            expectedMarker: string,
+            expectedClaimToken: string | null,
             message: string,
             statusCode: number,
             replay: boolean
         ): Promise<void> => {
             try {
-                const persisted = await persistRazorpayOrderId(key, order.id);
+                const persisted = await persistRazorpayOrderId({
+                    paymentOrderId,
+                    idempotencyKey: key,
+                    expectedMarker,
+                    expectedClaimToken,
+                    razorpayOrderId: order.id,
+                    userId,
+                    amount: amountInPaise,
+                    currency: "INR"
+                });
 
-                if (!persisted) {
+                const persistedStateVerified = Boolean(
+                    persisted &&
+                    persisted._id.toString() === paymentOrderId &&
+                    persisted.idempotencyKey === key &&
+                    persisted.razorpayOrderId === order.id &&
+                    persisted.userId.toString() === userId &&
+                    persisted.amount === amountInPaise &&
+                    persisted.currency === "INR"
+                );
+
+                if (!persistedStateVerified || !persisted) {
                     sendOrderPersistenceFailure(order.id);
                     return;
                 }
@@ -237,11 +617,41 @@ export const createOrder = async (
             }
         };
 
-        const createRazorpayOrder = async (replay: boolean): Promise<void> => {
+        // Only claim winners reach this function. The write-ahead dispatch
+        // marker is valid only for this claim token, so a recovered claim
+        // cannot be dispatched by an earlier request.
+        const createRazorpayOrder = async (
+            paymentOrderId: string,
+            claimToken: string,
+            replay: boolean
+        ): Promise<void> => {
+            const details = claimDetails(paymentOrderId);
+            const dispatchedMarker = callingOrderId(key, claimToken);
             const message = replay
                 ? "Request already processed."
                 : "Razorpay order created successfully.";
             const statusCode = replay ? 200 : 201;
+
+            if (
+                !(await markRazorpayOrderCreationDispatched(
+                    details,
+                    claimToken
+                ))
+            ) {
+                const current = await PaymentOrder.findById(
+                    paymentOrderId
+                ).catch(() => null);
+
+                if (current) {
+                    await handleExistingPaymentOrder(current);
+                    return;
+                }
+
+                sendUnresolvedCreation(
+                    "Order creation claim is no longer active; retry with the same Idempotency-Key."
+                );
+                return;
+            }
 
             try {
                 const order = await razorpay.orders.create({
@@ -250,8 +660,51 @@ export const createOrder = async (
                     receipt
                 });
 
-                await persistAndRespond(order, message, statusCode, replay);
+                await persistAndRespond(
+                    order,
+                    paymentOrderId,
+                    dispatchedMarker,
+                    claimToken,
+                    message,
+                    statusCode,
+                    replay
+                );
             } catch (error) {
+                const errorDetails = getRazorpayOrderErrorDetails(error);
+
+                // Only documented, unambiguous rejections prove that no order
+                // was created. Everything else is reconciled by receipt and
+                // keeps the calling marker.
+                if (isDefinitiveRazorpayOrderRejection(error)) {
+                    const released =
+                        await releaseRazorpayOrderCreationClaim(
+                            details,
+                            claimToken
+                        );
+
+                    if (!released) {
+                        const current = await PaymentOrder.findById(
+                            paymentOrderId
+                        ).catch(() => null);
+
+                        if (
+                            current &&
+                            !isPendingOrderId(current.razorpayOrderId) &&
+                            !isCreatingOrderId(current.razorpayOrderId) &&
+                            !isCallingOrderId(current.razorpayOrderId)
+                        ) {
+                            await handleExistingPaymentOrder(current);
+                            return;
+                        }
+                    }
+
+                    res.status(400).json({
+                        message: "Razorpay rejected the order creation request.",
+                        reason: errorDetails.description ?? errorDetails.code
+                    });
+                    return;
+                }
+
                 const recovery = await lookupRazorpayOrderByReceipt(
                     receipt,
                     amountInPaise,
@@ -261,6 +714,9 @@ export const createOrder = async (
                 if (recovery.kind === "found") {
                     await persistAndRespond(
                         recovery.order,
+                        paymentOrderId,
+                        dispatchedMarker,
+                        claimToken,
                         message,
                         statusCode,
                         replay
@@ -283,10 +739,9 @@ export const createOrder = async (
                     recovery
                 });
 
-                res.status(503).json({
-                    message: "Razorpay order creation is unresolved; retry with the same Idempotency-Key.",
-                    requiresReconciliation: true
-                });
+                sendUnresolvedCreation(
+                    "Razorpay order creation is unresolved; retry with the same Idempotency-Key."
+                );
             }
         };
 
@@ -304,11 +759,31 @@ export const createOrder = async (
                 return;
             }
 
-            if (!isPendingOrderId(existingPaymentOrder.razorpayOrderId)) {
+            const paymentOrderId = existingPaymentOrder._id.toString();
+            const marker = existingPaymentOrder.razorpayOrderId;
+            const markerClaimToken = claimTokenFromMarker(marker);
+            const storedClaimToken =
+                typeof existingPaymentOrder.creationClaimToken === "string" &&
+                existingPaymentOrder.creationClaimToken.length > 0
+                    ? existingPaymentOrder.creationClaimToken
+                    : null;
+            const activeClaimToken =
+                markerClaimToken !== null &&
+                markerClaimToken === storedClaimToken
+                    ? storedClaimToken
+                    : null;
+
+            if (
+                !isPendingOrderId(marker) &&
+                !isCreatingOrderId(marker) &&
+                !isCallingOrderId(marker)
+            ) {
                 sendPersistedOrder(existingPaymentOrder, "Request already processed.");
                 return;
             }
 
+            // Receipt recovery runs for every marker. A found order is
+            // persisted conditionally; no second Razorpay create is attempted.
             const recovery = await lookupRazorpayOrderByReceipt(
                 receipt,
                 amountInPaise,
@@ -318,6 +793,9 @@ export const createOrder = async (
             if (recovery.kind === "found") {
                 await persistAndRespond(
                     recovery.order,
+                    paymentOrderId,
+                    marker,
+                    activeClaimToken,
                     "Request already processed.",
                     200,
                     true
@@ -340,14 +818,90 @@ export const createOrder = async (
                     error: recovery.error
                 });
 
-                res.status(503).json({
-                    message: "Order creation is unresolved; retry with the same Idempotency-Key.",
-                    requiresReconciliation: true
-                });
+                sendUnresolvedCreation(
+                    "Order creation is unresolved; retry with the same Idempotency-Key."
+                );
                 return;
             }
 
-            await createRazorpayOrder(true);
+            if (isCallingOrderId(marker)) {
+                // The external call was dispatched. Even an expired lease cannot
+                // prove that Razorpay did not create the order.
+                sendUnresolvedCreation(
+                    "Razorpay order creation was dispatched but not confirmed; retry with the same Idempotency-Key."
+                );
+                return;
+            }
+
+            if (isCreatingOrderId(marker)) {
+                if (!hasOrderCreationClaimExpired(existingPaymentOrder.updatedAt)) {
+                    sendCreationInProgress();
+                    return;
+                }
+
+                // Only claims with an exact, known token can be proven to have
+                // been abandoned before dispatch. Legacy or inconsistent
+                // markers must be reconciled, not recreated.
+                if (
+                    activeClaimToken === null ||
+                    existingPaymentOrder.creationDispatchedAt !== null ||
+                    marker !== creatingOrderId(key, activeClaimToken)
+                ) {
+                    sendUnresolvedCreation(
+                        "Order creation claim cannot be safely released; reconcile with Razorpay using the same Idempotency-Key."
+                    );
+                    return;
+                }
+
+                // No dispatch marker and no Razorpay order by receipt: this
+                // claim was abandoned before the external call. Recovery clears
+                // the token, invalidating it before any new claim is created.
+                if (
+                    !(await recoverAbandonedRazorpayOrderCreationClaim(
+                        claimDetails(paymentOrderId),
+                        activeClaimToken
+                    ))
+                ) {
+                    const current = await PaymentOrder.findById(
+                        paymentOrderId
+                    ).catch(() => null);
+
+                    if (current && current.razorpayOrderId !== marker) {
+                        await handleExistingPaymentOrder(current);
+                        return;
+                    }
+
+                    sendCreationInProgress();
+                    return;
+                }
+            }
+
+            const nextClaimToken = newOrderCreationClaimToken();
+
+            if (
+                await claimRazorpayOrderCreation(
+                    claimDetails(paymentOrderId),
+                    nextClaimToken
+                )
+            ) {
+                await createRazorpayOrder(
+                    paymentOrderId,
+                    nextClaimToken,
+                    true
+                );
+                return;
+            }
+
+            const current = await PaymentOrder.findById(paymentOrderId).catch(
+                () => null
+            );
+
+            if (!current || current.razorpayOrderId === marker) {
+                sendCreationInProgress();
+                return;
+            }
+
+            await handleExistingPaymentOrder(current);
         };
 
         const existingPaymentOrder = await PaymentOrder.findOne({
@@ -367,7 +921,9 @@ export const createOrder = async (
             amount: amountInPaise,
             currency: "INR",
             idempotencyKey: key,
-            status: "CREATED"
+            status: "CREATED",
+            creationDispatchedAt: null,
+            creationClaimToken: null
         });
 
         try {
@@ -387,7 +943,27 @@ export const createOrder = async (
             throw error;
         }
 
-        await createRazorpayOrder(false);
+        const details = claimDetails(paymentOrder._id.toString());
+        const initialClaimToken = newOrderCreationClaimToken();
+
+        if (!(await claimRazorpayOrderCreation(details, initialClaimToken))) {
+            const current = await PaymentOrder.findById(
+                details.paymentOrderId
+            ).catch(() => null);
+
+            if (current) {
+                await handleExistingPaymentOrder(current);
+                return;
+            }
+
+            throw new Error("Razorpay order creation claim was lost after save.");
+        }
+
+        await createRazorpayOrder(
+            details.paymentOrderId,
+            initialClaimToken,
+            false
+        );
 
     } catch (error) {
         console.error("Create Razorpay order error:", error);
