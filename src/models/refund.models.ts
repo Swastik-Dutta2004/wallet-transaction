@@ -5,7 +5,8 @@ import mongoose, { Document, Schema, Types } from "mongoose";
 //   CREATED   - the idempotency key has been claimed and the refund capacity
 //               and wallet funds have been reserved. Razorpay has not
 //               confirmed anything yet (the call is in flight, or the
-//               process stopped before the call).
+//               process stopped before the call). `dispatchClaimed` records
+//               whether permission to call Razorpay was atomically taken.
 //   PENDING   - Razorpay accepted the refund (or the outcome is unknown,
 //               e.g. a timeout) but it is NOT completed yet. The
 //               reservation stays held and the wallet is NOT debited.
@@ -39,6 +40,14 @@ export interface IRefund extends Document {
     // and funds on Wallet.reservedBalance. It is set to false once the refund
     // is finalized (debited) or its reservation is released.
     reservationActive: boolean;
+
+    // Atomically set immediately before calling Razorpay. Reconciliation must
+    // not release the reservation while this is true: the external refund may
+    // be in flight, or may already have succeeded without its id being stored
+    // locally. Default false keeps legacy rows readable; queries that need to
+    // prove dispatch never happened use an explicit `false` match, so legacy
+    // rows without the field fail closed.
+    dispatchClaimed: boolean;
 
     // True when we could not confirm the final state, for example a timeout
     // while calling Razorpay, or a database failure after Razorpay already
@@ -107,6 +116,12 @@ const refundSchema = new Schema<IRefund>(
         },
 
         reservationActive: {
+            type: Boolean,
+            required: true,
+            default: false
+        },
+
+        dispatchClaimed: {
             type: Boolean,
             required: true,
             default: false

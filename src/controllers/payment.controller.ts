@@ -2980,6 +2980,7 @@ async function claimRefundKey(details: {
             currency: details.currency,
             status: "CREATED",
             reservationActive: false,
+            dispatchClaimed: false,
             requiresReconciliation: false,
             idempotencyKey: details.idempotencyKey,
             reason: details.reason
@@ -3015,6 +3016,26 @@ async function claimRefundKey(details: {
 // Razorpay receipt.
 function refundTransactionKey(refundId: string | mongoose.Types.ObjectId): string {
     return `refund:${String(refundId)}`;
+}
+
+// Atomically claims permission to call Razorpay for this refund. A single
+// conditional update is enough: MongoDB only lets one caller flip the flag.
+// It is written BEFORE the external call and is durable, so reconciliation can
+// tell "dispatch not started" from "possibly in flight / already succeeded".
+// `$ne: true` also matches legacy rows written before this field existed.
+async function claimRefundDispatch(refundId: string): Promise<boolean> {
+    const claimed = await Refund.findOneAndUpdate(
+        {
+            _id: refundId,
+            status: "CREATED",
+            reservationActive: true,
+            dispatchClaimed: { $ne: true }
+        },
+        { $set: { dispatchClaimed: true } },
+        { new: true }
+    );
+
+    return Boolean(claimed);
 }
 
 // Finalizes a refund that Razorpay has confirmed as processed.
@@ -3231,10 +3252,15 @@ async function finalizeRefund(refundId: string): Promise<RefundStatus> {
 
 // Releases a reservation WITHOUT debiting the wallet. Used when a refund is
 // definitively not going to happen, so the held capacity and funds must be
-// given back.
+// given back. `requireUndispatched` is used by reconciliation when the only
+// evidence is "Razorpay has no refund yet": in that case the release is
+// guarded by an explicit dispatchClaimed === false, so a concurrent or in-flight
+// dispatch cannot be undone. Callers that have a definitive Razorpay rejection
+// leave it unset because dispatch is already known to be closed.
 async function releaseRefundReservation(
     refundId: string,
-    failureReason: string
+    failureReason: string,
+    options: { requireUndispatched?: boolean } = {}
 ): Promise<RefundStatus> {
 
     let session: mongoose.ClientSession | undefined;
@@ -3250,7 +3276,16 @@ async function releaseRefundReservation(
             statusAfterAttempt = undefined;
 
             const refund = await Refund.findOneAndUpdate(
-                { _id: refundId, status: { $in: ["CREATED", "PENDING"] } },
+                {
+                    _id: refundId,
+                    status: { $in: ["CREATED", "PENDING"] },
+                    // Explicit false (not $ne: true) is deliberate: a legacy
+                    // row with no dispatchClaimed field cannot prove dispatch
+                    // never happened, so it fails closed here.
+                    ...(options.requireUndispatched
+                        ? { dispatchClaimed: false }
+                        : {})
+                },
                 {
                     $set: {
                         status: "FAILED",
@@ -3906,6 +3941,20 @@ export const createRefund = async (
                 message: "Refund is still being processed.",
                 refund: serializeRefund(current ?? refund)
             });
+            return;
+        }
+
+        // Atomically claim permission to dispatch. Without this the original
+        // request could send a refund to Razorpay after reconciliation already
+        // released the reservation and marked the row FAILED.
+        if (!await claimRefundDispatch(String(refund._id))) {
+            const current = await Refund.findById(refund._id).catch(() => null);
+
+            await respondWithRefundResult(
+                res,
+                String(refund._id),
+                current?.status ?? "PENDING"
+            );
             return;
         }
 
@@ -4614,17 +4663,55 @@ export const reconcileRefund = async (
 
         if (!razorpayRefund) {
             // Complete, successful search: no matching refund exists at
-            // Razorpay. Only safe to release when we never stored an id.
+            // Razorpay. "Not found yet" is NOT proof that dispatch will never
+            // happen -- the original request may be between reservation and
+            // dispatch, mid-flight, or may have succeeded without persisting
+            // the Razorpay refund id yet. Fail closed in those cases.
             if (!refund.razorpayRefundId) {
+                if (refund.dispatchClaimed) {
+                    // A webhook may have finalized the row while the Razorpay
+                    // lookup was in flight; never report it as unresolved then.
+                    if (await respondWithFinalStatusIfChanged()) {
+                        return;
+                    }
+
+                    await markReconciliationPending(
+                        "Razorpay reported no refund, but dispatch was already claimed; the outcome is unknown."
+                    );
+
+                    const current = await Refund.findById(refund._id);
+
+                    res.status(202).json({
+                        message: "Refund dispatch outcome is unknown; reconciliation is required.",
+                        refund: current ? serializeRefund(current) : serializeRefund(refund),
+                        requiresReconciliation: true
+                    });
+                    return;
+                }
+
                 const finalStatus = await releaseRefundReservation(
                     String(refund._id),
-                    "No matching refund was found at Razorpay."
+                    "No matching refund was found at Razorpay.",
+                    // Guarded so a dispatch claimed after the row was read
+                    // cannot have its reservation released underneath it.
+                    { requireUndispatched: true }
                 );
+
+                if (finalStatus !== "FAILED") {
+                    // The row changed concurrently (for example dispatch was
+                    // claimed). Keep the reservation and flag it instead of
+                    // releasing funds that may already be owed externally.
+                    await markReconciliationPending(
+                        "Razorpay reported no refund while dispatch may still be in progress."
+                    );
+                }
+
+                const current = await Refund.findById(refund._id);
 
                 await respondWithRefundResult(
                     res,
                     String(refund._id),
-                    finalStatus
+                    current?.status ?? finalStatus
                 );
                 return;
             }
