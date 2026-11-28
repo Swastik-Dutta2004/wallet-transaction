@@ -1,3 +1,8 @@
 node_modules
 .env
 REFUND_SYSTEM.md
+web/node_modules
+web/.next
+web/out
+web/.env*.local
+web/*.tsbuildinfo

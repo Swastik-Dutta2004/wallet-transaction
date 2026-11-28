@@ -20,6 +20,11 @@
   },
   "scripts": {
     "dev": "nodemon --exec ts-node server.ts",
-    "start": "ts-node server.ts"
+    "start": "ts-node server.ts",
+    "dev:web": "npm --prefix web run dev",
+    "build:web": "npm --prefix web run build",
+    "start:web": "npm --prefix web run start",
+    "typecheck:web": "npm --prefix web run typecheck",
+    "lint:web": "npm --prefix web run lint"
   }
 }
