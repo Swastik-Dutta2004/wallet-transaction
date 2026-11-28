@@ -3008,6 +3008,15 @@ async function claimRefundKey(details: {
     }
 }
 
+// Internal transaction key for the refund DEBIT. It is deliberately derived
+// from the refund document ID, never from the client-supplied idempotency key,
+// so a client key reused from the payment CREDIT cannot collide here. The
+// client key stays on Refund.idempotencyKey for request dedupe and as the
+// Razorpay receipt.
+function refundTransactionKey(refundId: string | mongoose.Types.ObjectId): string {
+    return `refund:${String(refundId)}`;
+}
+
 // Finalizes a refund that Razorpay has confirmed as processed.
 //
 // The status transition CREATED/PENDING -> PROCESSED is the lock that stops
@@ -3111,15 +3120,17 @@ async function finalizeRefund(refundId: string): Promise<RefundStatus> {
                 throw new Error("Payment reservation is missing during refund finalization.");
             }
 
-            // 4. Exactly one DEBIT transaction. Reusing the refund's idempotency
-            //    key means a retry cannot create a second one.
+            // 4. Exactly one DEBIT transaction. The key is scoped to this
+            //    refund, so it cannot collide with the payment CREDIT that
+            //    used the same client idempotency key. The guarded status
+            //    transition above still prevents a second DEBIT on retry.
             const transaction = new Transaction({
                 walletId: wallet._id,
                 type: "DEBIT",
                 amount: refund.amount,
                 currency: refund.currency,
                 status: "Success",
-                idempotencyKey: refund.idempotencyKey,
+                idempotencyKey: refundTransactionKey(refund._id),
                 description: "Refund for Razorpay payment"
             });
 
@@ -3176,7 +3187,8 @@ async function finalizeRefund(refundId: string): Promise<RefundStatus> {
 
         // Razorpay has refunded the customer. Only a still-reserved,
         // non-terminal row is eligible for recovery; terminal PROCESSED/FAILED
-        // rows must never be downgraded to PENDING.
+        // rows must never be downgraded to PENDING. A duplicate-key error here
+        // is therefore treated as unresolved, never as proof of finalization.
         try {
             await Refund.updateOne(
                 {
