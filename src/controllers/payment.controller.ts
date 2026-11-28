@@ -1069,9 +1069,17 @@ export const verifyPayment = async (
             return;
         }
 
-        // An order already marked FAILED must not be credited
+        // An order marked FAILED is retryable only when a different payment
+        // ID was recorded as failed. That evidence is rechecked by
+        // verifyPaymentCaptureState before any wallet credit is written.
 
-        if (paymentOrder.status === "FAILED") {
+        if (
+            paymentOrder.status === "FAILED" &&
+            !failedOrderAllowsDifferentPayment(
+                paymentOrder,
+                String(razorpay_payment_id)
+            )
+        ) {
             res.status(400).json({
                 message: "Payment order has already failed."
             });
@@ -1350,6 +1358,7 @@ type PaymentCaptureVerification =
     | {
         kind: "absent";
         paymentOrder: IPaymentOrder;
+        recoverFailedOrder: boolean;
         details: Record<string, unknown>;
     }
     | { kind: "verified"; details: Record<string, unknown> }
@@ -1380,6 +1389,27 @@ type PaymentCaptureOutcome =
 
 function samePaymentObjectId(left: unknown, right: unknown): boolean {
     return left != null && right != null && String(left) === String(right);
+}
+
+// A FAILED order may be retried only when Razorpay recorded a different failed
+// payment ID for that order. Orders with no such evidence are legacy/order-level
+// failures and must stay terminal.
+function failedOrderAllowsDifferentPayment(
+    paymentOrder: IPaymentOrder,
+    razorpayPaymentId: string
+): boolean {
+    if (paymentOrder.status !== "FAILED") {
+        return false;
+    }
+
+    const failedPaymentIds = Array.isArray(paymentOrder.failedPaymentIds)
+        ? paymentOrder.failedPaymentIds
+        : [];
+
+    return failedPaymentIds.length > 0 &&
+        !failedPaymentIds.some(
+            (failedId) => String(failedId) === String(razorpayPaymentId)
+        );
 }
 
 function paymentCaptureLogDetails(
@@ -1523,8 +1553,8 @@ async function verifyPaymentCaptureState(
             await Transaction.findOne({ idempotencyKey: identity.idempotencyKey })
                 .session(querySession);
 
-        // No payment and no transaction: either this is genuinely new, or the
-        // order is already terminal/final without its financial records.
+        // No payment and no transaction: either this is genuinely new, a
+        // verified retry of a FAILED order, or an inconsistent terminal state.
         if (!paymentByPaymentId && !transactionByKey) {
             if (persistedPaymentOrder.status === "PAID") {
                 return {
@@ -1538,19 +1568,35 @@ async function verifyPaymentCaptureState(
             }
 
             if (persistedPaymentOrder.status === "FAILED") {
+                if (
+                    !failedOrderAllowsDifferentPayment(
+                        persistedPaymentOrder,
+                        identity.razorpayPaymentId
+                    )
+                ) {
+                    return {
+                        kind: "conflict",
+                        reason:
+                            "PaymentOrder is FAILED and this payment is not a verified retry.",
+                        details: {
+                            ...details,
+                            persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
+                        }
+                    };
+                }
+
                 return {
-                    kind: "conflict",
-                    reason: "PaymentOrder is FAILED although a captured payment was received.",
-                    details: {
-                        ...details,
-                        persistedPaymentOrder: summarizePaymentOrder(persistedPaymentOrder)
-                    }
+                    kind: "absent",
+                    paymentOrder: persistedPaymentOrder,
+                    recoverFailedOrder: true,
+                    details
                 };
             }
 
             return {
                 kind: "absent",
                 paymentOrder: persistedPaymentOrder,
+                recoverFailedOrder: false,
                 details
             };
         }
@@ -1998,17 +2044,30 @@ export const handleWebhook = async (
                     }
 
                     // 13. Conditionally transition the PaymentOrder read in this
-                    // transaction from CREATED to PAID. This is done before any
-                    // writes so a failed transition cannot commit partial state.
+                    // transaction to PAID. A FAILED order is eligible only when
+                    // a different payment ID was recorded as failed and no
+                    // financial records exist for this capture. This is done
+                    // before any writes so a failed transition cannot commit
+                    // partial state.
 
                     const persistedPaymentOrder =
                         existingStateInTransaction.paymentOrder;
+
+                    const statusFilter =
+                        existingStateInTransaction.recoverFailedOrder
+                            ? {
+                                status: "FAILED" as const,
+                                failedPaymentIds: {
+                                    $nin: [identity.razorpayPaymentId]
+                                }
+                            }
+                            : { status: "CREATED" as const };
 
                     const paidTransition =
                         await PaymentOrder.updateOne(
                             {
                                 _id: persistedPaymentOrder._id,
-                                status: "CREATED",
+                                ...statusFilter,
                                 razorpayOrderId: persistedPaymentOrder.razorpayOrderId,
                                 userId: persistedPaymentOrder.userId,
                                 amount: persistedPaymentOrder.amount,
@@ -2024,7 +2083,7 @@ export const handleWebhook = async (
                             kind: "state_incomplete" as const,
                             verification: {
                                 kind: "incomplete" as const,
-                                reason: "PaymentOrder could not be transitioned from CREATED to PAID.",
+                                reason: "PaymentOrder could not be transitioned to PAID.",
                                 details: {
                                     ...paymentCaptureLogDetails(identity),
                                     matchedCount: paidTransition.matchedCount,
@@ -2236,16 +2295,36 @@ export const handleWebhook = async (
             const razorpayOrderId =
                 paymentEntity.order_id;
 
+            if (
+                typeof paymentEntity.id !== "string" ||
+                paymentEntity.id.length === 0 ||
+                typeof razorpayOrderId !== "string" ||
+                razorpayOrderId.length === 0
+            ) {
+                res.status(400).json({
+                    message: "Payment data is missing."
+                });
+                return;
+            }
+
             console.log(
                 "Razorpay payment failed:",
                 paymentEntity.id
             );
 
-            // Find our PaymentOrder
+            // Record the failed attempt as evidence. The order stays FAILED,
+            // but a later different payment can only recover it through the
+            // guarded capture verification path.
 
             await PaymentOrder.findOneAndUpdate(
-                { razorpayOrderId, status: "CREATED" },
-                { $set: { status: "FAILED" } }
+                {
+                    razorpayOrderId,
+                    status: { $in: ["CREATED", "FAILED"] }
+                },
+                {
+                    $set: { status: "FAILED" },
+                    $addToSet: { failedPaymentIds: paymentEntity.id }
+                }
             );
 
             res.status(200).json({

@@ -15,6 +15,11 @@ export interface IPaymentOrder extends Document {
 
     status: "CREATED" | "PAID" | "FAILED";
 
+    // Payment IDs Razorpay reported as failed for this order. An order may be
+    // retried with a different payment, so attempt failures are recorded as
+    // evidence instead of being the only reason the order is FAILED.
+    failedPaymentIds?: string[];
+
     // null on a new creation claim, set only immediately before the first
     // Razorpay call. Absent means a pre-recovery-version record.
     creationDispatchedAt?: Date | null;
@@ -63,6 +68,11 @@ const paymentOrderSchema = new Schema<IPaymentOrder>(
             type: String,
             enum: ["CREATED", "PAID", "FAILED"],
             default: "CREATED"
+        },
+
+        failedPaymentIds: {
+            type: [String],
+            default: []
         },
 
         creationDispatchedAt: {
